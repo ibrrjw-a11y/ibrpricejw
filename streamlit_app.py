@@ -11,8 +11,7 @@ from io import BytesIO
 # - 리서치 입력(국내/해외/경쟁) → Market Reference Band 생성
 # - 결과: Target + 추천 밴드(Min~Target~Max) + 룰검증/자동보정 + 진단
 #
-# ✅ 변경사항(2026-02-02):
-# - 라방이 원데이특가보다 더 싸야 함
+# ✅ 라방이 원데이특가보다 더 싸야 함
 #   => 온라인 레벨 순서(고가→저가):
 #      상시 ≥ 홈사 ≥ 브랜드위크 ≥ 원데이특가 ≥ 모바일라방가(최저)
 # ============================================================
@@ -22,7 +21,6 @@ st.set_page_config(page_title="IBR Pricing Simulator", layout="wide")
 # ----------------------------
 # Constants
 # ----------------------------
-# Online-only price levels
 ONLINE_LEVELS = ["상시할인가", "홈사할인가", "브랜드위크가", "원데이 특가", "모바일라방가"]
 ONLINE_TYPES = ["공식가(노출)"] + ONLINE_LEVELS
 CHANNEL_TYPES = ["공구가", "홈쇼핑가"] + ONLINE_TYPES
@@ -224,6 +222,7 @@ def compute_reference_band(row):
 
     ref_min = np.nanmin(mins) if len(mins) else (np.nanmin(mids) if len(mids) else np.nan)
     ref_max = np.nanmax(maxs) if len(maxs) else (np.nanmax(mids) if len(mids) else np.nan)
+
     if len(mids):
         ref_mid = float(np.nanmedian(mids))
     else:
@@ -452,9 +451,6 @@ with tab_data:
             sel_df = master_df[master_df["품번"].isin(sel_codes)].copy()
 
             base = st.session_state["inputs_df"].copy()
-            if base.empty:
-                base = st.session_state["inputs_df"]
-
             sel_df["온라인기준수량(Q_online)"] = 1
             sel_df["홈쇼핑구성(Q_hs)"] = 1
             sel_df["공구구성(Q_gb)"] = 1
@@ -525,12 +521,9 @@ def compute_for_all(df_in,
                     fee_online=0.20,
                     fee_hs=0.35,
                     fee_gb=0.15,
-                    # M1/M3
                     hs_under_online=0.10,
-                    # M2
                     hs_anchor_source="입력값(홈쇼핑가)",
                     hs_position_in_band=15,
-                    # M3
                     hs_q_candidates=(2, 4, 6, 8),
                     gb_q_candidates=(2, 4, 6),
                     ):
@@ -590,7 +583,7 @@ def compute_for_all(df_in,
         official_unit = derive_official_from_always(online_units["상시할인가"], list_disc)
         official_unit = max(official_unit, max(online_units.values()))
 
-        # online lowest (now likely 라방)
+        # online lowest
         online_lowest = min([online_units[k] for k in ONLINE_LEVELS if not np.isnan(online_units[k])])
 
         hs_unit = np.nan
@@ -702,7 +695,6 @@ def compute_for_all(df_in,
 
         always_final = unit_prices2.get("상시할인가", np.nan)
         hs_final = unit_prices2.get("홈쇼핑가", np.nan)
-        gb_final = unit_prices2.get("공구가", np.nan)
 
         if not np.isnan(ref_mid) and not np.isnan(always_final):
             online_adv = (always_final - ref_mid) / max(1.0, ref_mid)
@@ -751,8 +743,6 @@ def compute_for_all(df_in,
 
         add("공구가", unit_prices2.get("공구가", np.nan), gb_q)
         add("홈쇼핑가", unit_prices2.get("홈쇼핑가", np.nan), hs_q)
-
-        # Online (Q_online)
         add("상시할인가", unit_prices2.get("상시할인가", np.nan), q_online)
         add("홈사할인가", unit_prices2.get("홈사할인가", np.nan), q_online)
         add("브랜드위크가", unit_prices2.get("브랜드위크가", np.nan), q_online)
@@ -772,7 +762,7 @@ def compute_for_all(df_in,
     return out, warn_df, diag_df
 
 # ----------------------------
-# SIM TAB
+# SIM TAB  (✅ st.stop 제거 / 계산식 탭 항상 노출)
 # ----------------------------
 with tab_sim:
     st.subheader("모드 선택(1안/2안/3안)")
@@ -780,16 +770,17 @@ with tab_sim:
     mode = MODES[mode_label]
     st.markdown(f"<div class='hint'>선택 모드: <b>{mode_label}</b></div>", unsafe_allow_html=True)
 
-if st.session_state["inputs_df"].empty:
-    st.warning("데이터 업로드/선택 탭에서 상품을 선택해 입력 테이블에 추가해주세요.")
-    st.info("계산식(로직) 탭은 항상 확인할 수 있습니다.")
-    run_calc = False
-else:
-    run_calc = None  # 아래에서 calc_clicked로 결정
+    st.divider()
+    st.subheader("입력 테이블(리서치 포함)")
 
+    if st.session_state["inputs_df"].empty:
+        st.warning("데이터 업로드/선택 탭에서 상품을 선택해 입력 테이블에 추가해주세요.")
+        st.info("계산식(로직) 탭은 항상 확인할 수 있습니다.")
+        show_inputs = False
+    else:
+        show_inputs = True
 
-    # 공통 파라미터 (계산 버튼 눌렀을 때만 반영되도록 form 아래로 내려도 되지만,
-    # 너 UX 기준: 편집 먼저 하고 계산 버튼 누르기 흐름이면 여기에 둬도 OK
+    # 공통 파라미터
     st.divider()
     st.subheader("공통 파라미터(추천 밴드 포함)")
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
@@ -808,7 +799,6 @@ else:
     st.subheader("온라인 가격 구조(상시 기준 할인율)")
     o1, o2, o3, o4, o5, o6 = st.columns([1, 1, 1, 1, 1, 1])
 
-    # ✅ 기본값 변경: 라방이 원데이보다 싸도록(라방 할인율 > 원데이 할인율)
     with o1:
         d_brandweek = st.slider("브랜드위크 할인율(%)", 0, 70, 25, 1) / 100.0
     with o2:
@@ -864,7 +854,6 @@ else:
         st.subheader("1안 추가 파라미터 (온라인→HS/공구 설계)")
         hs_under_online = st.slider("HS 단위가는 온라인 최저(라방) 대비 -%(목표)", 0, 40, 10, 1) / 100.0
         st.caption("라방이 온라인 최저이므로, HS는 라방보다 더 낮게 설계됨(정책).")
-
         hs_anchor_source = "입력값(홈쇼핑가)"
         hs_position_in_band = 15
         hs_q_candidates = (2, 4, 6, 8)
@@ -875,7 +864,6 @@ else:
         st.subheader("2안 추가 파라미터 (HS→온라인 방어)")
         hs_anchor_source = st.radio("HS 앵커", ["입력값(홈쇼핑가)", "시장밴드에서 추천"], index=0)
         hs_position_in_band = st.slider("HS 포지셔닝(밴드 내) (%)", 0, 100, 15, 5)
-
         hs_under_online = 0.10
         hs_q_candidates = (2, 4, 6, 8)
         gb_q_candidates = (2, 4, 6)
@@ -885,107 +873,147 @@ else:
         st.subheader("3안 추가 파라미터 (패키지 리디자인: Q + 사은품)")
         hs_q_candidates = st.multiselect("HS 구성 후보(Q_hs)", options=[1,2,3,4,5,6,8,10], default=[2,4,6,8])
         gb_q_candidates = st.multiselect("공구 구성 후보(Q_gb)", options=[1,2,3,4,5,6,8,10], default=[2,4,6])
-
         hs_under_online = st.slider("HS 단위가 목표: 온라인 최저(라방) 대비 -%", 0, 40, 8, 1) / 100.0
         hs_anchor_source = "입력값(홈쇼핑가)"
         hs_position_in_band = 15
 
-    # ✅ 입력(편집)과 계산을 분리: form + 버튼
-    with st.form("input_form", clear_on_submit=False):
-        edited_df = st.data_editor(
-            st.session_state["inputs_df"],
-            key="inputs_editor",
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                # ⚠️ 기존 column_config를 여기에 그대로 붙여넣어야 함
-            },
-            height=360,
-        )
+    # 입력 폼(데이터가 있을 때만 의미 있음)
+    if show_inputs:
+        with st.form("input_form", clear_on_submit=False):
+            edited_df = st.data_editor(
+                st.session_state["inputs_df"],
+                key="inputs_editor",
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={},  # ✅ 비워둬도 동작 (원하면 기존 설정 그대로 넣기)
+                height=360,
+            )
+            c_save, c_calc = st.columns([1, 1])
+            save_clicked = c_save.form_submit_button("입력값 적용(저장)", type="secondary")
+            calc_clicked = c_calc.form_submit_button("계산 실행", type="primary")
 
-        c_save, c_calc = st.columns([1, 1])
-        save_clicked = c_save.form_submit_button("입력값 적용(저장)", type="secondary")
-        calc_clicked = c_calc.form_submit_button("계산 실행", type="primary")
+        if save_clicked or calc_clicked:
+            st.session_state["inputs_df"] = edited_df.copy()
 
-    if save_clicked or calc_clicked:
-        st.session_state["inputs_df"] = edited_df.copy()
+        if not calc_clicked:
+            st.info("입력값을 수정한 뒤 '계산 실행'을 눌러 결과를 업데이트하세요.")
+            run_calc = False
+        else:
+            run_calc = True
 
-    if not calc_clicked:
-    st.info("입력값을 수정한 뒤 '계산 실행'을 눌러 결과를 업데이트하세요.")
-    st.stop()
+        if run_calc:
+            out, warn_df, diag_df = compute_for_all(
+                st.session_state["inputs_df"],
+                mode_label=mode_label,
+                mode=mode,
+                rounding_unit=rounding_unit,
+                auto_band=auto_band,
+                band_pct_manual=band_pct_manual,
+                positioning=positioning,
+                discounts=discounts,
+                list_disc=list_disc,
+                auto_correct=auto_correct,
+                enforce_monotonic=enforce_monotonic,
+                gb_under_hs_min=gb_under_hs_min,
+                online_over_hs_min=online_over_hs_min,
+                use_guard=use_guard,
+                min_margin=min_margin,
+                fee_online=fee_online,
+                fee_hs=fee_hs,
+                fee_gb=fee_gb,
+                hs_under_online=hs_under_online,
+                hs_anchor_source=hs_anchor_source,
+                hs_position_in_band=hs_position_in_band,
+                hs_q_candidates=tuple(hs_q_candidates),
+                gb_q_candidates=tuple(gb_q_candidates),
+            )
 
-out, warn_df, diag_df = compute_for_all(...)
+            st.divider()
+            st.subheader("진단 요약(추천 밴드 포함)")
+            if diag_df.empty:
+                st.info("진단 데이터가 없습니다.")
+            else:
+                st.dataframe(diag_df, use_container_width=True, height=260)
 
+            st.divider()
+            st.subheader("룰 위반/클립/손익 경고 로그")
+            if warn_df.empty:
+                st.success("경고 없음(현재 설정 기준)")
+            else:
+                st.warning(f"{len(warn_df):,}건")
+                st.dataframe(warn_df, use_container_width=True, height=220)
 
-    st.divider()
-    st.subheader("진단 요약(추천 밴드 포함)")
-    if diag_df.empty:
-        st.info("진단 데이터가 없습니다.")
-    else:
-        st.dataframe(diag_df, use_container_width=True, height=260)
+            st.divider()
+            st.subheader("추천 가격 밴드 결과 (Min / Target / Max)")
+            if out.empty:
+                st.warning("결과가 없습니다. (리서치 입력 부족 또는 앵커 입력 누락 가능)")
+            else:
+                st.dataframe(out, use_container_width=True, height=360)
 
-    st.divider()
-    st.subheader("룰 위반/클립/손익 경고 로그")
-    if warn_df.empty:
-        st.success("경고 없음(현재 설정 기준)")
-    else:
-        st.warning(f"{len(warn_df):,}건")
-        st.dataframe(warn_df, use_container_width=True, height=220)
+                st.subheader("요약(타겟가 피벗)")
+                pv = out.pivot_table(index=["품번", "신규품명"], columns="가격타입", values="Target", aggfunc="first")
+                pv = pv.reindex(columns=CHANNEL_TYPES, fill_value=np.nan)
+                st.dataframe(pv.reset_index(), use_container_width=True, height=300)
 
-    st.divider()
-    st.subheader("추천 가격 밴드 결과 (Min / Target / Max)")
-    if out.empty:
-        st.warning("결과가 없습니다. (리서치 입력 부족 또는 앵커 입력 누락 가능)")
-    else:
-        st.dataframe(out, use_container_width=True, height=360)
+                st.divider()
+                st.subheader("가격 범위 도식화")
+                options = (out["품번"] + " | " + out["신규품명"]).drop_duplicates().tolist()
+                picked = st.multiselect("도식화할 상품 선택", options=options, default=options[: min(6, len(options))])
+                if picked:
+                    mask = (out["품번"] + " | " + out["신규품명"]).isin(picked)
+                    render_range_bars(out[mask], "선택 상품 가격 밴드(추천)")
 
-        st.subheader("요약(타겟가 피벗)")
-        pv = out.pivot_table(index=["품번", "신규품명"], columns="가격타입", values="Target", aggfunc="first")
-        pv = pv.reindex(columns=CHANNEL_TYPES, fill_value=np.nan)
-        st.dataframe(pv.reset_index(), use_container_width=True, height=300)
-
-        st.divider()
-        st.subheader("가격 범위 도식화")
-        options = (out["품번"] + " | " + out["신규품명"]).drop_duplicates().tolist()
-        picked = st.multiselect("도식화할 상품 선택", options=options, default=options[: min(6, len(options))])
-        if picked:
-            mask = (out["품번"] + " | " + out["신규품명"]).isin(picked)
-            render_range_bars(out[mask], "선택 상품 가격 밴드(추천)")
-
-        st.divider()
-        xbytes = to_excel_bytes({
-            "result_long": out,
-            "result_pivot": pv.reset_index(),
-            "diagnosis": diag_df,
-            "warnings": warn_df if not warn_df.empty else pd.DataFrame(columns=["품번", "신규품명", "메시지"]),
-        })
-        st.download_button(
-            "결과 엑셀 다운로드",
-            data=xbytes,
-            file_name="pricing_result.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+                st.divider()
+                xbytes = to_excel_bytes({
+                    "result_long": out,
+                    "result_pivot": pv.reset_index(),
+                    "diagnosis": diag_df,
+                    "warnings": warn_df if not warn_df.empty else pd.DataFrame(columns=["품번", "신규품명", "메시지"]),
+                })
+                st.download_button(
+                    "결과 엑셀 다운로드",
+                    data=xbytes,
+                    file_name="pricing_result.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
 # ----------------------------
-# FORMULA TAB
+# FORMULA TAB  (✅ 항상 렌더됨)
 # ----------------------------
 with tab_formula:
     st.subheader("계산식(로직) — 운영 언어 + 근거 (현재 코드 기준)")
 
-    st.markdown("## 온라인 레벨 순서(카니발 방지)")
+    st.markdown("## 1) 시장 기준 밴드(RefMin / RefMid / RefMax)")
     st.markdown(
         """
-### 온라인 레벨은 아래 ‘가격 질서’를 강제합니다(고가→저가)
-**상시할인가 ≥ 홈사할인가 ≥ 브랜드위크가 ≥ 원데이 특가 ≥ 모바일라방가(최저)**
+- **RefMin**: 국내/경쟁/해외/직구 입력 중 *가장 낮은 값*
+- **RefMax**: 국내/경쟁/해외/직구/해외정가(RRP) 중 *가장 높은 값*
+- **RefMid**: 입력된 '중앙값 후보들'의 **중앙값(median)**
 
-#### 근거
-- 라방은 ‘방송 한정/즉시 구매 유도’ 성격이 강해서, 일반적으로 온라인 내에서도 최저로 떨어지는 경우가 많음.
-- 원데이 특가는 기간 한정이지만, 라방보다 “즉시성/전환유도”가 약한 경우가 있어 라방을 더 강하게 내릴 수 있음.
+**왜 median?**
+- 리서치 데이터는 “극단값(한두 개)”이 섞이기 쉬움 → 평균보다 중앙값이 가격 결정을 덜 흔듦.
 """
     )
 
     st.divider()
-    st.markdown("## 공식가(노출)")
+    st.markdown("## 2) 온라인 가격 구조(상시 기준 할인 사다리)")
+    st.markdown(
+        """
+상시할인가를 A라고 할 때:
+
+- 홈사할인가 = A × (1 - d_home)
+- 브랜드위크가 = A × (1 - d_brandweek)
+- 원데이 특가 = A × (1 - d_oneday)
+- 모바일라방가 = A × (1 - d_live)
+
+✅ **온라인 레벨 순서 강제(카니발 방지)**
+- **상시 ≥ 홈사 ≥ 브랜드위크 ≥ 원데이 ≥ 라방(최저)**
+- 위반 시 자동보정 ON이면 *깨진 레벨을 상향해서 질서를 복구*
+"""
+    )
+
+    st.divider()
+    st.markdown("## 3) 공식가(노출)")
     st.markdown(
         """
 - 공식가 = 상시 / (1 - 상시할인율)
@@ -993,6 +1021,28 @@ with tab_formula:
 """
     )
 
-# ----------------------------
-# DATA TAB already defined above
-# ----------------------------
+    st.divider()
+    st.markdown("## 4) 홈쇼핑/공구 질서")
+    st.markdown(
+        """
+- 공구가 ≤ 홈쇼핑가 × (1 - 공구추가할인율)
+- 온라인 레벨들은 홈쇼핑가 × (1 + 온라인방어%) 보다 낮아지면 안 됨
+
+**근거(운영 논리)**
+- 홈쇼핑은 대량 노출/방송 한정 최저를 만들기 위한 채널이므로,
+  온라인이 방송 최저를 깨면 “카니발”이 바로 발생.
+"""
+    )
+
+    st.divider()
+    st.markdown("## 5) 밴드(Min~Target~Max)")
+    st.markdown(
+        """
+Target을 T, 밴드폭을 b(%)라고 하면:
+
+- Min = T × (1 - b/2)
+- Max = T × (1 + b/2)
+
+자동추천 ON이면 **시장 밴드 폭(ref_max/ref_min)**이 넓을수록 b를 더 크게 추천합니다.
+"""
+    )
