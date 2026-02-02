@@ -780,11 +780,13 @@ with tab_sim:
     mode = MODES[mode_label]
     st.markdown(f"<div class='hint'>선택 모드: <b>{mode_label}</b></div>", unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader("입력 테이블(리서치 포함)")
-    if st.session_state["inputs_df"].empty:
-        st.warning("데이터 업로드/선택 탭에서 상품을 선택해 입력 테이블에 추가해주세요.")
-        st.stop()
+if st.session_state["inputs_df"].empty:
+    st.warning("데이터 업로드/선택 탭에서 상품을 선택해 입력 테이블에 추가해주세요.")
+    st.info("계산식(로직) 탭은 항상 확인할 수 있습니다.")
+    run_calc = False
+else:
+    run_calc = None  # 아래에서 calc_clicked로 결정
+
 
     # 공통 파라미터 (계산 버튼 눌렀을 때만 반영되도록 form 아래로 내려도 되지만,
     # 너 UX 기준: 편집 먼저 하고 계산 버튼 누르기 흐름이면 여기에 둬도 OK
@@ -909,34 +911,11 @@ with tab_sim:
         st.session_state["inputs_df"] = edited_df.copy()
 
     if not calc_clicked:
-        st.info("입력값을 수정한 뒤 '계산 실행'을 눌러 결과를 업데이트하세요.")
-        st.stop()
+    st.info("입력값을 수정한 뒤 '계산 실행'을 눌러 결과를 업데이트하세요.")
+    st.stop()
 
-    out, warn_df, diag_df = compute_for_all(
-        st.session_state["inputs_df"],
-        mode_label=mode_label,
-        mode=mode,
-        rounding_unit=rounding_unit,
-        auto_band=auto_band,
-        band_pct_manual=band_pct_manual,
-        positioning=positioning,
-        discounts=discounts,
-        list_disc=list_disc,
-        auto_correct=auto_correct,
-        enforce_monotonic=enforce_monotonic,
-        gb_under_hs_min=gb_under_hs_min,
-        online_over_hs_min=online_over_hs_min,
-        use_guard=use_guard,
-        min_margin=min_margin,
-        fee_online=fee_online,
-        fee_hs=fee_hs,
-        fee_gb=fee_gb,
-        hs_under_online=hs_under_online,
-        hs_anchor_source=hs_anchor_source,
-        hs_position_in_band=hs_position_in_band,
-        hs_q_candidates=tuple(hs_q_candidates),
-        gb_q_candidates=tuple(gb_q_candidates),
-    )
+out, warn_df, diag_df = compute_for_all(...)
+
 
     st.divider()
     st.subheader("진단 요약(추천 밴드 포함)")
