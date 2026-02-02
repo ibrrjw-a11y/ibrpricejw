@@ -554,41 +554,36 @@ with tab_sim:
         st.stop()
 
     # Show editable table
-    inputs_df = st.data_editor(
+    # ✅ 입력(편집)과 계산을 분리: form + 버튼
+with st.form("input_form", clear_on_submit=False):
+    edited_df = st.data_editor(
         st.session_state["inputs_df"],
+        key="inputs_editor",  # ✅ 고정 key: 입력값 튐/지워짐 방지
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "품번": st.column_config.TextColumn(disabled=True),
-            "신규품명": st.column_config.TextColumn(disabled=True),
-            "브랜드(추정)": st.column_config.TextColumn(disabled=True),
-
-            "온라인기준수량(Q_online)": st.column_config.NumberColumn(min_value=1, step=1),
-            "홈쇼핑구성(Q_hs)": st.column_config.NumberColumn(min_value=1, step=1),
-            "공구구성(Q_gb)": st.column_config.NumberColumn(min_value=1, step=1),
-
-            "랜디드코스트(총원가)": st.column_config.NumberColumn(min_value=0, step=10),
-
-            "국내관측_min": st.column_config.NumberColumn(min_value=0, step=100),
-            "국내관측_max": st.column_config.NumberColumn(min_value=0, step=100),
-            "경쟁사_min": st.column_config.NumberColumn(min_value=0, step=100),
-            "경쟁사_max": st.column_config.NumberColumn(min_value=0, step=100),
-            "경쟁사_avg": st.column_config.NumberColumn(min_value=0, step=100),
-
-            "해외정가_RRP": st.column_config.NumberColumn(min_value=0, step=100),
-            "해외실판매_min": st.column_config.NumberColumn(min_value=0, step=100),
-            "해외실판매_max": st.column_config.NumberColumn(min_value=0, step=100),
-            "직구가": st.column_config.NumberColumn(min_value=0, step=100),
-
-            "홈쇼핑가(세트가)_입력": st.column_config.NumberColumn(min_value=0, step=100),
-            "공구가(세트가)_입력": st.column_config.NumberColumn(min_value=0, step=100),
-
-            "사은품가치(원)_hs": st.column_config.NumberColumn(min_value=0, step=1000),
-            "사은품가치(원)_gb": st.column_config.NumberColumn(min_value=0, step=1000),
+            # ✅ 여기에는 네가 원래 쓰던 column_config 내용을 그대로 붙여 넣으면 됨
+            # (즉, 아까 삭제한 블록의 column_config 딕셔너리를 그대로 복붙)
         },
         height=360,
     )
-    st.session_state["inputs_df"] = inputs_df
+
+    c_save, c_calc = st.columns([1, 1])
+    save_clicked = c_save.form_submit_button("입력값 적용(저장)", type="secondary")
+    calc_clicked = c_calc.form_submit_button("계산 실행", type="primary")
+
+# ✅ 저장/계산 버튼 눌렀을 때만 session_state 갱신
+if save_clicked or calc_clicked:
+    st.session_state["inputs_df"] = edited_df.copy()
+
+# ✅ '계산 실행' 누르기 전에는 아래 계산/도식화가 돌아가지 않게 막음(속도 개선 핵심)
+if not calc_clicked:
+    st.info("입력값을 수정한 뒤 '계산 실행'을 눌러 결과를 업데이트하세요.")
+    st.stop()
+out, warn_df, diag_df = compute_for_all(inputs_df)
+# ✅ 계산은 여기부터 (오직 calc_clicked일 때만 실행)
+inputs_df = st.session_state["inputs_df"]
+
 
     st.divider()
     st.subheader("공통 파라미터(추천 밴드 포함)")
@@ -1002,7 +997,7 @@ with tab_sim:
 
         return out, warn_df, diag_df
 
-    out, warn_df, diag_df = compute_for_all(inputs_df)
+    
 
     st.divider()
     st.subheader("진단 요약(추천 밴드 포함)")
