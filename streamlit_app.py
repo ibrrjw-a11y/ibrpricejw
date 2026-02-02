@@ -1,181 +1,253 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 
 # =========================
-# Helpers
+# Utils
 # =========================
-def pct(x: float) -> float:
-    """percent input (e.g., 10) -> ratio (0.10)"""
+def pct_to_rate(x: float) -> float:
     return max(0.0, float(x)) / 100.0
 
 def krw_round(x: float, unit: int = 100) -> int:
-    """KRW rounding to unit (e.g., 100원 단위)"""
-    if np.isnan(x) or np.isinf(x):
+    if x is None or np.isnan(x) or np.isinf(x):
         return 0
     return int(round(x / unit) * unit)
 
-def guardrail_min_price(landed_cost: float, channel_total_cost_rate: float, min_margin_rate: float) -> float:
-    """
-    손익/마진 하한선 가격.
-    Price * (1 - channel_cost_rate) - landed_cost >= Price * min_margin_rate
-    => Price * (1 - channel_cost_rate - min_margin_rate) >= landed_cost
-    => Price >= landed_cost / (1 - channel_cost_rate - min_margin_rate)
-    """
-    denom = 1.0 - channel_total_cost_rate - min_margin_rate
+def guardrail_min_price(landed_cost: float, channel_cost_rate: float, min_margin_rate: float) -> float:
+    denom = 1.0 - channel_cost_rate - min_margin_rate
     if denom <= 0:
         return np.inf
     return landed_cost / denom
 
-def pick_market_anchor(market_low: float, market_mid: float, market_high: float, position: str) -> float:
-    if position == "하단":
-        return market_low
-    if position == "상단":
-        return market_high
-    return market_mid  # 중앙
-
-def list_price_from_position(market_mid: float, market_high: float, pos: str) -> float:
-    # 정가 포지션: 낮게/비슷/높게를 아주 단순 룰로 매핑 (나중에 교체 가능)
-    if pos == "낮게":
-        return market_mid
-    if pos == "높게":
-        return market_high
-    return (market_mid + market_high) / 2
-
 def apply_import_cap(price: float, import_ref: float, premium_rate: float) -> float:
-    """직구 캡: price <= import_ref * (1+premium)"""
     cap = import_ref * (1.0 + premium_rate)
     return min(price, cap)
 
 # =========================
-# Core compute (MVP rules; replace later in Step 3)
+# Engines: compute LIST(공식가)
 # =========================
-def compute_price_band(
+def list_price_market_index(market_mid: float, market_high: float, position: str) -> float:
+    # 공식가를 시장에서 어디에 둘지 (단순 규칙: 중간/중상/상단)
+    if position == "중앙":
+        return market_mid
+    if position == "중상":
+        return (market_mid + market_high) / 2
+    return market_high  # 상단
+
+def list_price_list_discount(comp_list_mid: float, comp_list_high: float, position: str) -> float:
+    # 경쟁 정가 분포 기반 공식가
+    if position == "비슷":
+        return comp_list_mid
+    if position == "높게":
+        return comp_list_high
+    return (comp_list_mid + comp_list_high) / 2  # 살짝 높게
+
+def list_price_margin_builder(landed_cost: float, channel_cost_rate: float, target_margin_rate: float) -> float:
+    # 공식가를 '목표마진'으로 만드는 방식 (채널별로 공식가가 달라질 수 있어 정책 선택 필요)
+    denom = 1.0 - channel_cost_rate - target_margin_rate
+    if denom <= 0:
+        return np.inf
+    return landed_cost / denom
+
+# =========================
+# Price ladder types
+# =========================
+PRICE_TYPES = ["상시할인가", "홈사할인가", "모바일라방가", "브랜드위크가", "원데이 특가"]
+
+DEFAULT_LADDER = pd.DataFrame([
+    {"가격타입": "상시할인가",   "MinDisc%": 15.0, "TargetDisc%": 20.0, "MaxDisc%": 25.0},
+    {"가격타입": "홈사할인가",   "MinDisc%": 18.0, "TargetDisc%": 25.0, "MaxDisc%": 32.0},
+    {"가격타입": "모바일라방가", "MinDisc%": 20.0, "TargetDisc%": 28.0, "MaxDisc%": 35.0},
+    {"가격타입": "브랜드위크가", "MinDisc%": 25.0, "TargetDisc%": 33.0, "MaxDisc%": 40.0},
+    {"가격타입": "원데이 특가",  "MinDisc%": 30.0, "TargetDisc%": 40.0, "MaxDisc%": 50.0},
+])
+
+def ladder_prices(list_price: float, min_disc: float, tgt_disc: float, max_disc: float):
+    # 할인율이 클수록 가격은 낮아짐
+    p_max = list_price * (1.0 - pct_to_rate(min_disc))   # 가장 덜 할인 = 상단
+    p_tgt = list_price * (1.0 - pct_to_rate(tgt_disc))
+    p_min = list_price * (1.0 - pct_to_rate(max_disc))   # 가장 많이 할인 = 하단
+    return p_min, p_tgt, p_max
+
+# =========================
+# Main compute
+# =========================
+def compute_all(
     landed_cost: float,
     min_margin_rate: float,
     channels_df: pd.DataFrame,
-    mode: str,  # "소비자가 일관형" or "순마진 일관형"
-    # Market-Index inputs
-    market_low: float | None,
+    engine: str,
+    # engine inputs
     market_mid: float | None,
     market_high: float | None,
-    market_position: str,
-    # Import-Parity inputs
-    import_avg: float | None,
-    import_min: float | None,
-    import_premium_rate: float,
+    market_pos: str,
+    comp_list_mid: float | None,
+    comp_list_high: float | None,
+    comp_list_pos: str,
+    target_margin_rate_for_list: float | None,
+    # import cap
     use_import_cap: bool,
-    # List-then-Discount inputs
-    use_list_discount: bool,
-    comp_disc_avg_rate: float | None,
-    comp_disc_max_rate: float | None,
-    list_position: str,
+    import_ref: float | None,
+    import_premium_rate: float,
+    # ladder
+    ladder_df: pd.DataFrame,
+    # list price policy
+    list_price_policy: str,  # "전채널 동일" or "채널별(원가반영)"
 ):
     df = channels_df.copy()
-
-    # channel total cost rate
-    df["수수료율"] = df["수수료율"].astype(float)
-    df["프로모션율"] = df["프로모션율"].astype(float)
-    df["반품율"] = df["반품율"].astype(float)
-
+    for col in ["수수료율", "프로모션율", "반품율"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     df["채널비용율(합)"] = df["수수료율"] + df["프로모션율"] + df["반품율"]
 
-    # 1) Guardrail min per channel
-    df["Min(하한)"] = df["채널비용율(합)"].apply(lambda r: guardrail_min_price(landed_cost, r, min_margin_rate))
+    rows = []
 
-    # 2) Target / Max logic
-    # Anchor base target from market index (if provided)
-    base_target = None
-    if market_low is not None and market_mid is not None and market_high is not None:
-        base_target = pick_market_anchor(market_low, market_mid, market_high, market_position)
+    # 1) compute list price per channel (or shared)
+    shared_list_price = None
+    if list_price_policy == "전채널 동일":
+        if engine == "시장앵커형":
+            shared_list_price = list_price_market_index(market_mid, market_high, market_pos)
+        elif engine == "정가-할인형":
+            shared_list_price = list_price_list_discount(comp_list_mid, comp_list_high, comp_list_pos)
+        else:  # 원가-마진형
+            # 전채널 동일로 쓰려면 기준 채널(대표 채널) 하나를 정해야 하는데,
+            # MVP에선 '온라인(오픈마켓)' 첫 행을 기준으로 삼음.
+            base_rate = float(df.iloc[0]["채널비용율(합)"]) if len(df) else 0.0
+            shared_list_price = list_price_margin_builder(landed_cost, base_rate, target_margin_rate_for_list or (min_margin_rate + 0.15))
 
-    # List-then-Discount if enabled (derive list price + discount-driven target/min)
-    base_list = None
-    if use_list_discount and market_mid is not None and market_high is not None:
-        base_list = list_price_from_position(market_mid, market_high, list_position)
+        if use_import_cap and import_ref is not None:
+            shared_list_price = apply_import_cap(shared_list_price, import_ref, import_premium_rate)
 
-    results = []
-    for _, row in df.iterrows():
-        ch = row["채널"]
-        cost_rate = row["채널비용율(합)"]
-        min_price = row["Min(하한)"]
+    # 2) per channel compute guardrail min
+    df["GuardrailMin"] = df["채널비용율(합)"].apply(lambda r: guardrail_min_price(landed_cost, r, min_margin_rate))
 
-        # Determine channel target/max
-        if use_list_discount and base_list is not None and comp_disc_avg_rate is not None and comp_disc_max_rate is not None:
-            # 정가 기반 운영
-            list_price = base_list
-            target_price = list_price * (1.0 - comp_disc_avg_rate)  # 일상 판매가
-            max_price = list_price  # 정가를 상단으로
-            # 딜 하한: 최대 할인율 적용 (단, guardrail보다 낮아지면 guardrail로 올림)
-            min_candidate = list_price * (1.0 - comp_disc_max_rate)
-            min_price_final = max(min_price, min_candidate)
+    # 3) build ladder bands per channel
+    for _, ch in df.iterrows():
+        channel = ch["채널"]
+        cost_rate = float(ch["채널비용율(합)"])
+        guard_min = float(ch["GuardrailMin"])
+
+        if list_price_policy == "전채널 동일":
+            list_price = float(shared_list_price)
         else:
-            # 시장 앵커 기반
-            if base_target is None:
-                # 아무 시장 입력이 없으면 "원가 기반 목표마진 가격"을 Target으로 사용 (임시)
-                target_price = guardrail_min_price(landed_cost, cost_rate, min_margin_rate + 0.10)
+            # 채널별 공식가 (특히 원가-마진형일 때 의미가 큼)
+            if engine == "시장앵커형":
+                list_price = list_price_market_index(market_mid, market_high, market_pos)
+            elif engine == "정가-할인형":
+                list_price = list_price_list_discount(comp_list_mid, comp_list_high, comp_list_pos)
             else:
-                target_price = base_target
-            # Max는 시장 상단이 있으면 시장 상단, 없으면 Target의 1.15배(임시)
-            max_price = market_high if market_high is not None else target_price * 1.15
-            min_price_final = min_price
+                list_price = list_price_margin_builder(landed_cost, cost_rate, target_margin_rate_for_list or (min_margin_rate + 0.15))
 
-        # Import-Parity cap (optional)
-        if use_import_cap and import_avg is not None:
-            target_price = apply_import_cap(target_price, import_avg, import_premium_rate)
-            max_price = apply_import_cap(max_price, import_avg, import_premium_rate)
-            # Min도 직구캡에 걸릴 순 있지만 보통은 하한이 더 낮으니 그대로 둠 (원하면 cap 적용 가능)
+            if use_import_cap and import_ref is not None:
+                list_price = apply_import_cap(list_price, import_ref, import_premium_rate)
 
-        # Mode: consumer-consistent vs margin-consistent
-        if mode == "순마진 일관형":
-            # 채널별로 목표 Target이 동일하게 유지되는 게 아니라,
-            # '동일 마진'이 되도록 Target을 원가/비용율 기반으로 재계산.
-            # 여기서는 base target을 '목표 마진(min_margin + 0.10)'로 통일하는 예시.
-            target_price = guardrail_min_price(landed_cost, cost_rate, min_margin_rate + 0.10)
-            max_price = guardrail_min_price(landed_cost, cost_rate, min_margin_rate + 0.18)
-            # import cap 적용은 다시
-            if use_import_cap and import_avg is not None:
-                target_price = apply_import_cap(target_price, import_avg, import_premium_rate)
-                max_price = apply_import_cap(max_price, import_avg, import_premium_rate)
-
-        # Ensure ordering
-        target_price = max(target_price, min_price_final)
-        max_price = max(max_price, target_price)
-
-        results.append({
-            "채널": ch,
-            "Min(하한)": min_price_final,
-            "Target(목표)": target_price,
-            "Max(상한)": max_price,
+        # official exposure band (원하면 공식가도 밴드로 만들 수 있지만 MVP는 단일값)
+        rows.append({
+            "채널": channel, "가격타입": "공식가(노출)", "Min": list_price, "Target": list_price, "Max": list_price
         })
 
-    out = pd.DataFrame(results)
-    # KRW rounding
-    for c in ["Min(하한)", "Target(목표)", "Max(상한)"]:
-        out[c] = out[c].apply(lambda x: krw_round(x, 100))
+        for _, lad in ladder_df.iterrows():
+            pmin, ptgt, pmax = ladder_prices(
+                list_price,
+                lad["MinDisc%"], lad["TargetDisc%"], lad["MaxDisc%"]
+            )
+            # guardrail 적용
+            pmin = max(pmin, guard_min)
+            ptgt = max(ptgt, pmin)
+            pmax = max(pmax, ptgt)
+
+            rows.append({
+                "채널": channel,
+                "가격타입": lad["가격타입"],
+                "Min": pmin, "Target": ptgt, "Max": pmax
+            })
+
+    out = pd.DataFrame(rows)
+    for c in ["Min", "Target", "Max"]:
+        out[c] = out[c].apply(lambda x: krw_round(float(x), 100))
     return out
 
+# =========================
+# Chart
+# =========================
+def range_chart(df: pd.DataFrame):
+    # y label: 채널 | 가격타입
+    d = df.copy()
+    d["y"] = d["채널"] + " | " + d["가격타입"]
+
+    fig = go.Figure()
+
+    # Range segments
+    for _, r in d.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[r["Min"], r["Max"]],
+            y=[r["y"], r["y"]],
+            mode="lines",
+            line=dict(width=10),
+            showlegend=False,
+            hovertemplate=f"{r['y']}<br>Min: {r['Min']:,}원<br>Target: {r['Target']:,}원<br>Max: {r['Max']:,}원<extra></extra>"
+        ))
+        # Target marker
+        fig.add_trace(go.Scatter(
+            x=[r["Target"]],
+            y=[r["y"]],
+            mode="markers",
+            marker=dict(size=10),
+            showlegend=False,
+            hovertemplate=f"{r['y']}<br>Target: {r['Target']:,}원<extra></extra>"
+        ))
+
+    fig.update_layout(
+        height=min(900, 40 * len(d) + 120),
+        xaxis_title="가격(원)",
+        yaxis_title="",
+        margin=dict(l=10, r=10, t=30, b=10),
+    )
+    return fig
+
+def cannibal_warnings(df: pd.DataFrame):
+    # 간단 룰: 같은 채널에서 가격타입 Target이 단계적으로 내려가야 함
+    order = ["공식가(노출)"] + PRICE_TYPES
+    warnings = []
+
+    for ch in df["채널"].unique():
+        sub = df[df["채널"] == ch].set_index("가격타입")
+        prev = None
+        for t in order:
+            if t not in sub.index:
+                continue
+            cur = int(sub.loc[t, "Target"])
+            if prev is not None and cur > prev:
+                warnings.append(f"[{ch}] '{t}' Target({cur:,})가 상위 단계보다 높음 → 레벨/할인율 역전 가능")
+            prev = cur
+
+    return warnings
 
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="Dynamic Pricing Simulator (MVP)", layout="wide")
-st.title("Dynamic Pricing Simulator (Streamlit MVP)")
+st.set_page_config(page_title="Dynamic Pricing Simulator", layout="wide")
+st.title("Dynamic Pricing Simulator (공식가 + 가격레벨 밴드 + 카니발 도식화)")
 
 with st.sidebar:
     st.header("공통 입력")
     landed_cost = st.number_input("Landed Cost (원)", min_value=0, value=12000, step=100)
-    min_margin = st.number_input("최소 마진(%)", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
-    mode = st.radio("가격 정책 모드", ["소비자가 일관형", "순마진 일관형"], index=0)
+    min_margin = st.number_input("최소 마진(%) [하한용]", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
 
     st.divider()
-    st.header("로직 활성화")
-    use_market_index = st.checkbox("Market-Index (국내 시장가 앵커)", value=True)
-    use_import_cap = st.checkbox("Import-Parity (직구가 캡 적용)", value=True)
-    use_list_discount = st.checkbox("List-then-Discount (정가→할인율 운영)", value=False)
+    st.header("가격 엔진(공식가 산정)")
+    engine = st.radio("선택", ["시장앵커형", "정가-할인형", "원가-마진형"], index=0)
 
-# Channels input table
-st.subheader("채널 입력 (채널 추가는 여기서 행 추가)")
+    list_price_policy = st.radio("공식가 정책", ["전채널 동일", "채널별(원가반영)"], index=0)
+
+    st.divider()
+    st.header("직구캡(옵션)")
+    use_import_cap = st.checkbox("직구가 캡 적용", value=True)
+    import_ref = st.number_input("직구 실구매가 기준(원)", min_value=0, value=35000, step=500) if use_import_cap else None
+    import_premium = st.number_input("허용 프리미엄(%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5) if use_import_cap else 0.0
+
+# 채널 테이블
+st.subheader("채널 입력 (행 추가로 채널 확장)")
 default_channels = pd.DataFrame([
     {"채널": "온라인(오픈마켓)", "수수료율": 0.12, "프로모션율": 0.05, "반품율": 0.02},
     {"채널": "자사몰", "수수료율": 0.03, "프로모션율": 0.04, "반품율": 0.02},
@@ -186,98 +258,89 @@ default_channels = pd.DataFrame([
 if "channels_df" not in st.session_state:
     st.session_state["channels_df"] = default_channels
 
-edited = st.data_editor(
+channels_df = st.data_editor(
     st.session_state["channels_df"],
     num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "채널": st.column_config.TextColumn(required=True),
-        "수수료율": st.column_config.NumberColumn(help="예: 0.12 = 12%", min_value=0.0, max_value=1.0, step=0.01),
-        "프로모션율": st.column_config.NumberColumn(help="예: 0.05 = 5%", min_value=0.0, max_value=1.0, step=0.01),
-        "반품율": st.column_config.NumberColumn(help="예: 0.02 = 2%", min_value=0.0, max_value=1.0, step=0.01),
-    }
+    use_container_width=True
 )
-st.session_state["channels_df"] = edited
+st.session_state["channels_df"] = channels_df
 
-colA, colB = st.columns(2)
+# 엔진별 입력
+st.subheader("리서치/엔진 입력")
+c1, c2, c3 = st.columns(3)
 
-# Market-Index inputs
-with colA:
-    st.subheader("국내 시장 리서치 입력 (Market-Index)")
-    if use_market_index:
-        market_low = st.number_input("국내 가격 하단(원)", min_value=0, value=29000, step=500, key="m_low")
-        market_mid = st.number_input("국내 가격 중앙값/평균(원)", min_value=0, value=39000, step=500, key="m_mid")
-        market_high = st.number_input("국내 가격 상단(원)", min_value=0, value=49000, step=500, key="m_high")
-        market_position = st.selectbox("포지션", ["하단", "중앙", "상단"], index=1)
+market_mid = market_high = None
+comp_list_mid = comp_list_high = None
+target_margin_for_list = None
+
+with c1:
+    if engine == "시장앵커형":
+        market_mid = st.number_input("국내 시장가 중앙/평균(원)", min_value=0, value=39000, step=500)
+        market_high = st.number_input("국내 시장가 상단(원)", min_value=0, value=49000, step=500)
+        market_pos = st.selectbox("공식가 포지션", ["중앙", "중상", "상단"], index=1)
     else:
-        market_low = market_mid = market_high = None
-        market_position = "중앙"
-        st.caption("비활성화됨")
+        market_pos = "중앙"
+        st.caption("시장앵커형 선택 시 입력")
 
-# Import-Parity inputs
-with colB:
-    st.subheader("직구 리서치 입력 (Import-Parity)")
-    if use_import_cap:
-        import_avg = st.number_input("직구 실구매가 평균/중앙(원)", min_value=0, value=35000, step=500, key="i_avg")
-        import_min = st.number_input("직구 실구매가 최저(원)", min_value=0, value=32000, step=500, key="i_min")
-        import_premium = st.number_input("직구 대비 허용 프리미엄(%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
+with c2:
+    if engine == "정가-할인형":
+        comp_list_mid = st.number_input("경쟁 정가 중앙/평균(원)", min_value=0, value=49000, step=500)
+        comp_list_high = st.number_input("경쟁 정가 상단(원)", min_value=0, value=59000, step=500)
+        comp_list_pos = st.selectbox("우리 공식가(정가) 포지션", ["비슷", "높게", "중간"], index=2)
     else:
-        import_avg = import_min = None
-        import_premium = 0.0
-        st.caption("비활성화됨")
+        comp_list_pos = "비슷"
+        st.caption("정가-할인형 선택 시 입력")
 
-# List-then-Discount inputs
-st.subheader("정가→할인율 운영 (List-then-Discount)")
-if use_list_discount:
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        comp_disc_avg = st.number_input("경쟁 평균 표기 할인율(%)", min_value=0.0, max_value=90.0, value=20.0, step=0.5)
-    with c2:
-        comp_disc_max = st.number_input("경쟁 최대/딜 할인율(%)", min_value=0.0, max_value=90.0, value=35.0, step=0.5)
-    with c3:
-        list_position = st.selectbox("우리 정가 포지션", ["낮게", "비슷", "높게"], index=1)
-else:
-    comp_disc_avg = comp_disc_max = None
-    list_position = "비슷"
-    st.caption("비활성화됨 (필요시 사이드바에서 켜기)")
+with c3:
+    if engine == "원가-마진형":
+        target_margin_for_list = st.number_input("공식가용 목표마진(%)", min_value=0.0, max_value=90.0, value=30.0, step=0.5)
+    st.caption("원가-마진형에서만 사용")
 
-# Compute
-channels_df = st.session_state["channels_df"].copy()
-# convert sidebar % to ratios
-min_margin_rate = pct(min_margin)
-import_premium_rate = pct(import_premium)
-comp_disc_avg_rate = pct(comp_disc_avg) if comp_disc_avg is not None else None
-comp_disc_max_rate = pct(comp_disc_max) if comp_disc_max is not None else None
+# 가격레벨(할인율 밴드)
+st.subheader("가격레벨(판매가 종류) 할인율 밴드 입력")
+if "ladder_df" not in st.session_state:
+    st.session_state["ladder_df"] = DEFAULT_LADDER.copy()
 
-# Safety: ensure numeric rates
-for col in ["수수료율", "프로모션율", "반품율"]:
-    if col in channels_df.columns:
-        channels_df[col] = pd.to_numeric(channels_df[col], errors="coerce").fillna(0.0)
+ladder_df = st.data_editor(
+    st.session_state["ladder_df"],
+    num_rows="fixed",
+    use_container_width=True
+)
+st.session_state["ladder_df"] = ladder_df
 
-out = compute_price_band(
+# compute
+min_margin_rate = pct_to_rate(min_margin)
+import_premium_rate = pct_to_rate(import_premium)
+
+out = compute_all(
     landed_cost=float(landed_cost),
     min_margin_rate=min_margin_rate,
     channels_df=channels_df,
-    mode=mode,
-    market_low=market_low if use_market_index else None,
-    market_mid=market_mid if use_market_index else None,
-    market_high=market_high if use_market_index else None,
-    market_position=market_position,
-    import_avg=import_avg if use_import_cap else None,
-    import_min=import_min if use_import_cap else None,
-    import_premium_rate=import_premium_rate,
+    engine=engine,
+    market_mid=market_mid,
+    market_high=market_high,
+    market_pos=market_pos,
+    comp_list_mid=comp_list_mid,
+    comp_list_high=comp_list_high,
+    comp_list_pos=comp_list_pos,
+    target_margin_rate_for_list=pct_to_rate(target_margin_for_list) if target_margin_for_list is not None else None,
     use_import_cap=use_import_cap,
-    use_list_discount=use_list_discount,
-    comp_disc_avg_rate=comp_disc_avg_rate,
-    comp_disc_max_rate=comp_disc_max_rate,
-    list_position=list_position,
+    import_ref=float(import_ref) if use_import_cap else None,
+    import_premium_rate=import_premium_rate,
+    ladder_df=ladder_df,
+    list_price_policy=list_price_policy
 )
 
 st.divider()
-st.subheader("결과: 채널별 가격 밴드 (Min ~ Target ~ Max)")
+st.subheader("결과 테이블 (채널 x 가격타입 밴드)")
 st.dataframe(out, use_container_width=True)
 
-with st.expander("디버그/해석(간단)"):
-    st.write("- Min(하한)은 Landed Cost + 채널 비용 + 최소 마진을 만족하는 손익 방어선입니다.")
-    st.write("- Target/Max는 (시장 앵커 / 직구 캡 / 정가-할인 운영 / 정책 모드) 조합에 따라 바뀝니다.")
-    st.write("- Step 3에서 원하시는 산식으로 compute_price_band() 내부만 교체하면 UI는 그대로 유지됩니다.")
+st.subheader("가격 범위 도식화 (카니발/역전 체크)")
+fig = range_chart(out)
+st.plotly_chart(fig, use_container_width=True)
+
+warns = cannibal_warnings(out)
+if warns:
+    st.warning("카니발/레벨 역전 가능 경고:\n- " + "\n- ".join(warns))
+else:
+    st.success("기본 레벨 순서(공식가 → 상시 → … → 원데이)가 정상 범위로 보입니다.")
