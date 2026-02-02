@@ -580,12 +580,13 @@ if save_clicked or calc_clicked:
 if not calc_clicked:
     st.info("입력값을 수정한 뒤 '계산 실행'을 눌러 결과를 업데이트하세요.")
     st.stop()
-out, warn_df, diag_df = compute_for_all(inputs_df)
+
 # ✅ 계산은 여기부터 (오직 calc_clicked일 때만 실행)
 inputs_df = st.session_state["inputs_df"]
 
+out, warn_df, diag_df = compute_for_all(inputs_df)
 
-st.divider()
+    st.divider()
     st.subheader("공통 파라미터(추천 밴드 포함)")
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
 
