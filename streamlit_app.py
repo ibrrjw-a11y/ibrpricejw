@@ -1,58 +1,42 @@
-# streamlit_app.py
-# ============================================================
-# Pricing Simulator (Strict Channel Taxonomy)
-# - 온라인: 공식가(노출) + 5레벨(상시/홈사/라방/브위/원데이)
-# - 공구: 공구가만
-# - 홈쇼핑: 홈쇼핑가만
-# - 홈쇼핑 기간: 온라인 5레벨을 "홈쇼핑가 대비 +X%" 이상으로 바닥 상향
-# - 외부 시각화 라이브러리 없음 (HTML/CSS)
-# ============================================================
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date
+import re
 
-st.set_page_config(page_title="Pricing Simulator", layout="wide")
+# ============================================================
+# Pricing Rules Simulator (3 Engines)
+# - Online-only terms: 공식가, 상시/홈사/라방/브위/원데이 (온라인 채널에만 생성)
+# - Groupbuy: 공구가만
+# - Homeshopping: 홈쇼핑가만
+# - 3 Engines:
+#   1) 공구 앵커 사다리
+#   2) 홈쇼핑-공구 최저라인 + 온라인 업룰(카니발 방지)
+#   3) 마진 Guardrail + (1 또는 2) 결과 보정
+# - No plotly/matplotlib; HTML/CSS range visualization
+# ============================================================
+
+st.set_page_config(page_title="Pricing Rules Simulator (3안)", layout="wide")
 
 ONLINE_LEVELS = ["상시할인가", "홈사할인가", "모바일라방가", "브랜드위크가", "원데이 특가"]
-ONLINE_ONLY_TYPES = ["공식가(노출)"] + ONLINE_LEVELS
+ONLINE_TYPES = ["공식가(노출)"] + ONLINE_LEVELS
+OTHER_TYPES = ["공구가", "홈쇼핑가"]
 
-DEFAULT_LADDER = pd.DataFrame([
-    {"가격타입": "상시할인가",   "MinDisc%": 15.0, "TargetDisc%": 20.0, "MaxDisc%": 25.0},
-    {"가격타입": "홈사할인가",   "MinDisc%": 18.0, "TargetDisc%": 25.0, "MaxDisc%": 32.0},
-    {"가격타입": "모바일라방가", "MinDisc%": 20.0, "TargetDisc%": 28.0, "MaxDisc%": 35.0},
-    {"가격타입": "브랜드위크가", "MinDisc%": 25.0, "TargetDisc%": 33.0, "MaxDisc%": 40.0},
-    {"가격타입": "원데이 특가",  "MinDisc%": 30.0, "TargetDisc%": 40.0, "MaxDisc%": 50.0},
-])
-
-DEFAULT_CHANNELS = pd.DataFrame([
-    {"채널": "온라인(오픈마켓)", "채널구분": "온라인", "고정가(원)": "", "수수료율": 0.12, "프로모션율": 0.05, "반품율": 0.02},
-    {"채널": "자사몰",           "채널구분": "온라인", "고정가(원)": "", "수수료율": 0.03, "프로모션율": 0.04, "반품율": 0.02},
-    {"채널": "공구",             "채널구분": "공구",   "고정가(원)": 29900, "수수료율": 0.08, "프로모션율": 0.03, "반품율": 0.02},
-    {"채널": "홈쇼핑",           "채널구분": "홈쇼핑", "고정가(원)": 29900, "수수료율": 0.30, "프로모션율": 0.05, "반품율": 0.03},
+DEFAULT_PRODUCTS = pd.DataFrame([
+    {"브랜드": "아티키", "상품명": "타임 블루 병 250g", "구분": "단품", "구성수량(Q)": 1,
+     "랜디드코스트(총원가)": 9351, "홈쇼핑가(세트가)": 50000, "공구가(세트가)": 29600, "공식가(세트가)": 54000},
+    {"브랜드": "아티키", "상품명": "[2구] 타임 블루 250g 2병", "구분": "세트", "구성수량(Q)": 2,
+     "랜디드코스트(총원가)": 23675, "홈쇼핑가(세트가)": 219000, "공구가(세트가)": 56800, "공식가(세트가)": 99000},
 ])
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def pct_to_rate(x) -> float:
+def safe_float(x, default=np.nan):
     try:
-        return max(0.0, float(x)) / 100.0
-    except Exception:
-        return 0.0
-
-def krw_round(x: float, unit: int = 100) -> int:
-    try:
-        x = float(x)
-        if np.isnan(x) or np.isinf(x):
-            return 0
-        return int(round(x / unit) * unit)
-    except Exception:
-        return 0
-
-def safe_num(x, default=0.0) -> float:
-    try:
+        if x is None:
+            return default
+        if isinstance(x, str) and x.strip() == "":
+            return default
         v = float(x)
         if np.isnan(v) or np.isinf(v):
             return default
@@ -60,228 +44,62 @@ def safe_num(x, default=0.0) -> float:
     except Exception:
         return default
 
-def guardrail_min_price(landed_cost: float, channel_cost_rate: float, min_margin_rate: float) -> float:
-    # Price*(1-C) - LC >= Price*m  ->  Price >= LC / (1-C-m)
+def pct_to_rate(x):
+    return float(x) / 100.0
+
+def krw_round(x, unit):
+    try:
+        return int(round(float(x) / unit) * unit)
+    except Exception:
+        return 0
+
+def make_band(target_price, band_pct, rounding_unit):
+    """
+    band_pct = 6% 라면, Target 기준 +-3%로 Min/Max 생성.
+    """
+    t = float(target_price)
+    half = pct_to_rate(band_pct) / 2.0
+    pmin = t * (1.0 - half)
+    pmax = t * (1.0 + half)
+    return krw_round(pmin, rounding_unit), krw_round(t, rounding_unit), krw_round(pmax, rounding_unit)
+
+def guardrail_min_price(landed_cost, channel_cost_rate, min_margin_rate):
     denom = 1.0 - channel_cost_rate - min_margin_rate
     if denom <= 0:
         return float("inf")
     return landed_cost / denom
 
-def ladder_prices(list_price: float, min_disc_pct: float, tgt_disc_pct: float, max_disc_pct: float):
-    # 할인율이 클수록 가격은 낮아짐
-    p_max = list_price * (1.0 - pct_to_rate(min_disc_pct))   # 상단(덜 할인)
-    p_tgt = list_price * (1.0 - pct_to_rate(tgt_disc_pct))
-    p_min = list_price * (1.0 - pct_to_rate(max_disc_pct))   # 하단(많이 할인)
-    return p_min, p_tgt, p_max
-
-def apply_import_cap(price: float, import_ref: float, premium_rate: float) -> float:
-    cap = import_ref * (1.0 + premium_rate)
-    return min(price, cap)
-
-def ladder_validate(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    for col in ["MinDisc%", "TargetDisc%", "MaxDisc%"]:
-        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
-    # MinDisc <= TargetDisc <= MaxDisc
-    d["TargetDisc%"] = np.maximum(d["TargetDisc%"], d["MinDisc%"])
-    d["MaxDisc%"] = np.maximum(d["MaxDisc%"], d["TargetDisc%"])
-    return d
-
-# ----------------------------
-# Official price engines (ONLINE ONLY)
-# ----------------------------
-def engine_market_anchor(market_mid: float, market_high: float, position: str) -> float:
-    if position == "중앙":
-        return market_mid
-    if position == "중상":
-        return (market_mid + market_high) / 2
-    return market_high
-
-def engine_list_anchor(comp_list_mid: float, comp_list_high: float, position: str) -> float:
-    if position == "비슷":
-        return comp_list_mid
-    if position == "높게":
-        return comp_list_high
-    return (comp_list_mid + comp_list_high) / 2
-
-def engine_cost_margin(landed_cost: float, channel_cost_rate: float, target_margin_rate: float) -> float:
-    denom = 1.0 - channel_cost_rate - target_margin_rate
-    if denom <= 0:
-        return float("inf")
-    return landed_cost / denom
-
-# ----------------------------
-# Core compute
-# ----------------------------
-def compute_prices(
-    landed_cost: float,
-    min_margin_rate: float,
-    channels_df: pd.DataFrame,
-    ladder_df: pd.DataFrame,
-    # official price (online only)
-    engine_name: str,        # "시장앵커형" | "정가앵커형" | "원가-마진형"
-    list_price_policy: str,  # "온라인채널별" | "온라인공통"
-    market_mid: float | None,
-    market_high: float | None,
-    market_pos: str,
-    comp_list_mid: float | None,
-    comp_list_high: float | None,
-    comp_list_pos: str,
-    target_margin_for_list_rate: float | None,
-    # import cap (optional)
-    use_import_cap: bool,
-    import_ref: float | None,
-    import_premium_rate: float,
-):
-    df = channels_df.copy()
-
-    # normalize
-    if "채널구분" not in df.columns:
-        df["채널구분"] = "온라인"
-    if "고정가(원)" not in df.columns:
-        df["고정가(원)"] = ""
-
-    for col in ["수수료율", "프로모션율", "반품율"]:
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    df["채널비용율(합)"] = df["수수료율"] + df["프로모션율"] + df["반품율"]
-    df["GuardrailMin"] = df["채널비용율(합)"].apply(lambda r: guardrail_min_price(landed_cost, float(r), min_margin_rate))
-
-    ladder_df = ladder_validate(ladder_df)
-
-    # online common official price (optional)
-    online_common_list = None
-    if list_price_policy == "온라인공통":
-        # 대표 온라인 채널: 첫 번째 온라인 행
-        online_rows = df[df["채널구분"] == "온라인"]
-        base_rate = float(online_rows.iloc[0]["채널비용율(합)"]) if len(online_rows) else 0.0
-
-        if engine_name == "시장앵커형":
-            online_common_list = engine_market_anchor(safe_num(market_mid), safe_num(market_high), market_pos)
-        elif engine_name == "정가앵커형":
-            online_common_list = engine_list_anchor(safe_num(comp_list_mid), safe_num(comp_list_high), comp_list_pos)
-        else:
-            tmr = target_margin_for_list_rate if target_margin_for_list_rate is not None else (min_margin_rate + 0.15)
-            online_common_list = engine_cost_margin(landed_cost, base_rate, tmr)
-
-        if use_import_cap and import_ref is not None:
-            online_common_list = apply_import_cap(online_common_list, float(import_ref), import_premium_rate)
-
-    rows = []
-
-    for _, r in df.iterrows():
-        ch = str(r.get("채널", "")).strip() or "채널"
-        group = str(r.get("채널구분", "온라인")).strip() or "온라인"
-        guard_min = float(r["GuardrailMin"])
-        cost_rate = float(r["채널비용율(합)"])
-
-        # ---------- NON-ONLINE: single price only ----------
-        if group in ["공구", "홈쇼핑", "기타"]:
-            fixed = safe_num(r.get("고정가(원)"), 0.0)
-            final = max(fixed, guard_min) if fixed > 0 else guard_min
-            final = krw_round(final, 100)
-
-            price_type = "공구가" if group == "공구" else ("홈쇼핑가" if group == "홈쇼핑" else "기타채널가")
-            rows.append({"채널": ch, "채널구분": group, "가격타입": price_type, "Min": final, "Target": final, "Max": final})
-            continue
-
-        # ---------- ONLINE: official + 5 levels ----------
-        # official calc (ONLINE ONLY)
-        if list_price_policy == "온라인공통" and online_common_list is not None:
-            list_price = float(online_common_list)
-        else:
-            if engine_name == "시장앵커형":
-                list_price = engine_market_anchor(safe_num(market_mid), safe_num(market_high), market_pos)
-            elif engine_name == "정가앵커형":
-                list_price = engine_list_anchor(safe_num(comp_list_mid), safe_num(comp_list_high), comp_list_pos)
-            else:
-                tmr = target_margin_for_list_rate if target_margin_for_list_rate is not None else (min_margin_rate + 0.15)
-                list_price = engine_cost_margin(landed_cost, cost_rate, tmr)
-
-            if use_import_cap and import_ref is not None:
-                list_price = apply_import_cap(list_price, float(import_ref), import_premium_rate)
-
-        # official guardrail
-        list_price = max(float(list_price), guard_min)
-        list_price = krw_round(list_price, 100)
-
-        # ONLINE OFFICIAL (online only)
-        rows.append({"채널": ch, "채널구분": group, "가격타입": "공식가(노출)", "Min": list_price, "Target": list_price, "Max": list_price})
-
-        # ONLINE LEVELS
-        for _, lad in ladder_df.iterrows():
-            t = str(lad.get("가격타입", "")).strip()
-            if t not in ONLINE_LEVELS:
-                continue
-
-            pmin, ptgt, pmax = ladder_prices(
-                list_price,
-                safe_num(lad.get("MinDisc%", 0.0)),
-                safe_num(lad.get("TargetDisc%", 0.0)),
-                safe_num(lad.get("MaxDisc%", 0.0)),
-            )
-
-            # guardrail + monotonic
-            pmin = max(float(pmin), guard_min)
-            ptgt = max(float(ptgt), pmin)
-            pmax = max(float(pmax), ptgt)
-
-            rows.append({
-                "채널": ch,
-                "채널구분": group,
-                "가격타입": t,
-                "Min": krw_round(pmin, 100),
-                "Target": krw_round(ptgt, 100),
-                "Max": krw_round(pmax, 100),
-            })
-
-    out = pd.DataFrame(rows)
-
-    # sort
-    type_order = ["공구가", "홈쇼핑가", "기타채널가"] + ["공식가(노출)"] + ONLINE_LEVELS
-    out["__type_order"] = out["가격타입"].apply(lambda x: type_order.index(x) if x in type_order else 999)
-    out = out.sort_values(by=["채널구분", "채널", "__type_order"]).drop(columns=["__type_order"]).reset_index(drop=True)
-    return out
-
-def apply_hs_period_uplift(out_base: pd.DataFrame, uplift_pct: float) -> pd.DataFrame:
+def parse_units_from_text(text):
     """
-    홈쇼핑 기간: 온라인 레벨(5개)만 바닥 상향
-    기준 홈쇼핑가: out_base의 '홈쇼핑가' 중 최저값(여러 홈쇼핑 채널이 있으면 최저를 기준)
+    아주 러프한 구성 파서.
+    - '2병', '4박스', '6통', 'x 2개' 등에서 숫자를 하나라도 찾으면 그걸 Q로 제안
+    - 실패하면 None
     """
-    hs_rows = out_base[out_base["가격타입"] == "홈쇼핑가"]
-    if hs_rows.empty:
-        return out_base.copy()
-
-    hs_ref = float(hs_rows["Target"].min())
-    floor = hs_ref * (1.0 + float(uplift_pct) / 100.0)
-
-    out = out_base.copy()
-    mask = (out["채널구분"] == "온라인") & (out["가격타입"].isin(ONLINE_LEVELS))
-
-    for col in ["Min", "Target", "Max"]:
-        out.loc[mask, col] = out.loc[mask, col].astype(float).apply(lambda x: krw_round(max(x, floor), 100))
-
-    # monotonic per row
-    out.loc[mask, "Target"] = np.maximum(out.loc[mask, "Target"].astype(float), out.loc[mask, "Min"].astype(float))
-    out.loc[mask, "Max"] = np.maximum(out.loc[mask, "Max"].astype(float), out.loc[mask, "Target"].astype(float))
-    out.loc[mask, "Target"] = out.loc[mask, "Target"].apply(lambda x: krw_round(x, 100))
-    out.loc[mask, "Max"] = out.loc[mask, "Max"].apply(lambda x: krw_round(x, 100))
-
-    return out
+    if not isinstance(text, str) or not text.strip():
+        return None
+    m = re.search(r'(\d+)\s*(병|박스|통|개|세트)', text)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r'x\s*(\d+)', text.lower())
+    if m2:
+        return int(m2.group(1))
+    return None
 
 # ----------------------------
-# Theme-safe HTML range bars
+# Visualization: Theme-safe HTML range bars
 # ----------------------------
-def render_range_bars(df: pd.DataFrame, title: str):
+def render_range_bars(df, title):
     st.subheader(title)
 
-    d = df.copy()
-    d["label"] = d["채널"].astype(str) + " | " + d["가격타입"].astype(str)
+    if df.empty:
+        st.info("표시할 데이터가 없습니다.")
+        return
 
-    gmin = float(d["Min"].min()) if len(d) else 0.0
-    gmax = float(d["Max"].max()) if len(d) else 1.0
+    d = df.copy()
+    d["label"] = d["브랜드"].astype(str) + " | " + d["상품명"].astype(str) + " | " + d["가격타입"].astype(str)
+
+    gmin = float(d["Min"].min())
+    gmax = float(d["Max"].max())
     span = max(1.0, gmax - gmin)
 
     st.markdown(
@@ -290,7 +108,7 @@ def render_range_bars(df: pd.DataFrame, title: str):
 .dp-wrap { border-top: 1px solid rgba(128,128,128,0.35); padding-top: 6px; }
 .dp-row { display:flex; align-items:center; gap:12px; padding:6px 0; }
 .dp-label {
-  width: 360px; font-size: 13px;
+  width: 520px; font-size: 13px;
   color: var(--text-color) !important;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
@@ -349,147 +167,330 @@ def render_range_bars(df: pd.DataFrame, title: str):
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ============================================================
-# UI
+# 3 Engines (룰 3안)
 # ============================================================
-st.title("Pricing Simulator")
-st.caption("온라인(공식가+5레벨) / 공구(공구가만) / 홈쇼핑(홈쇼핑가만) — 온라인 용어는 온라인에만 생성")
 
-if "channels_df" not in st.session_state:
-    st.session_state["channels_df"] = DEFAULT_CHANNELS.copy()
-if "ladder_df" not in st.session_state:
-    st.session_state["ladder_df"] = DEFAULT_LADDER.copy()
+def engine1_groupbuy_ladder(unit_G, a, b, c, hs_premium_over_G):
+    """
+    1안: 공구 앵커 사다리 (단위가격 기준)
+    - 공구(Unit) = G
+    - 모바일(Unit) = G*(1+a)
+    - 행사(Unit) = G*(1+b)
+    - 상시(Unit) = G*(1+c)
+    - 홈쇼핑(Unit) = 공구(Unit)*(1+hs_premium_over_G)  (공구가 홈쇼핑보다 싸야하면 premium을 +로 둠)
+    """
+    G = float(unit_G)
+    hs = G * (1.0 + hs_premium_over_G)
+    mob = G * (1.0 + a)
+    evt = G * (1.0 + b)
+    always = G * (1.0 + c)
+    return {
+        "공구가": G,
+        "홈쇼핑가": hs,
+        "모바일라방가": mob,
+        "브랜드위크가": evt,     # 이벤트성(브위)을 행사로 매핑
+        "원데이 특가": max(G, evt * 0.85),  # 원데이를 행사보다 더 아래로 기본 설정 (조정 가능)
+        "홈사할인가": max(mob, evt * 0.95), # 홈사 = 라방~행사 사이 기본
+        "상시할인가": always,
+    }
 
+def engine2_hs_floor_with_uplift(unit_H, d, u, a, b, c):
+    """
+    2안: 홈쇼핑-공구 최저라인 + 온라인 업룰
+    - 홈쇼핑(Unit) = H (입력)
+    - 공구(Unit) = H*(1-d)  (공구가 홈쇼핑보다 더 싸야 함)
+    - 온라인최저허용선(Unit) = H*(1+u)  (카니발 방지 하한)
+    - 온라인 레벨들은 공구 기반 사다리 + 온라인최저허용선으로 바닥 상향
+    """
+    H = float(unit_H)
+    G = H * (1.0 - d)
+    floor_online = H * (1.0 + u)
+
+    mob = max(G * (1.0 + a), floor_online)
+    evt = max(G * (1.0 + b), floor_online)
+    always = max(G * (1.0 + c), floor_online)
+
+    # 나머지 레벨도 순서 유지
+    oneday = max(floor_online, evt * 0.85)      # 기본: 행사보다 낮게
+    homesale = max(mob * 0.98, floor_online)    # 기본: 라방 근처
+    brandweek = evt
+
+    return {
+        "공구가": G,
+        "홈쇼핑가": H,
+        "모바일라방가": mob,
+        "브랜드위크가": brandweek,
+        "원데이 특가": oneday,
+        "홈사할인가": homesale,
+        "상시할인가": always,
+        "온라인최저허용선": floor_online,
+    }
+
+def derive_official_from_online(unit_prices, official_mode, official_margin_over_always):
+    """
+    온라인 '공식가(노출)' 생성:
+    - 옵션 1) 상시할인가를 사실상 노출가로 쓰는 경우: 공식가 = 상시할인가
+    - 옵션 2) 상시할인가 위에 '정가 프레이밍'을 만들기: 공식가 = 상시*(1+margin)
+    """
+    always = unit_prices["상시할인가"]
+    if official_mode == "상시=공식":
+        return always
+    return always * (1.0 + official_margin_over_always)
+
+def apply_guardrail(unit_target, unit_guard):
+    return max(float(unit_target), float(unit_guard))
+
+# ============================================================
+# App UI
+# ============================================================
+
+st.title("Pricing Rules Simulator (3안)")
+st.caption("온라인 용어(공식가/상시/홈사/라방/브위/원데이)는 온라인에만 생성 | 공구=공구가만 | 홈쇼핑=홈쇼핑가만")
+
+# Session defaults
+if "products_df" not in st.session_state:
+    st.session_state["products_df"] = DEFAULT_PRODUCTS.copy()
+
+# Sidebar: Engine selection + global params
 with st.sidebar:
-    st.header("공통 입력")
-    landed_cost = st.number_input("Landed Cost (원)", min_value=0, value=12000, step=100)
-    min_margin_pct = st.number_input("최소 마진(%) [하한용]", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
+    st.header("엔진 선택(3안)")
+    engine = st.radio(
+        "가격 룰",
+        [
+            "1안) 공구 앵커 사다리",
+            "2안) 홈쇼핑-공구 최저라인 + 온라인 업룰",
+            "3안) 마진 Guardrail + (1/2) 보정",
+        ],
+        index=1
+    )
 
     st.divider()
-    st.header("온라인 공식가 산정")
-    engine_name = st.radio("엔진 선택", ["시장앵커형", "정가앵커형", "원가-마진형"], index=0)
-    list_price_policy = st.radio("공식가 정책(온라인만)", ["온라인공통", "온라인채널별"], index=0)
+    st.header("공통 설정")
+    rounding_unit = st.selectbox("반올림 단위", [10, 100, 1000], index=1)
+    band_pct = st.slider("가격 밴드폭(%) (Min~Max)", min_value=0, max_value=20, value=6, step=1)
+    st.caption("예: 6%면 Target 기준 ±3%로 Min/Max 생성")
 
     st.divider()
-    st.header("직구 캡(옵션, 온라인 공식가에만 적용)")
-    use_import_cap = st.checkbox("직구가 캡 적용", value=True)
-    import_ref = None
-    import_premium_pct = 0.0
-    if use_import_cap:
-        import_ref = st.number_input("직구 실구매가 기준(원)", min_value=0, value=35000, step=500)
-        import_premium_pct = st.number_input("허용 프리미엄(%)", min_value=0.0, max_value=200.0, value=5.0, step=0.5)
+    st.header("온라인 공식가 생성 방식")
+    official_mode = st.radio("공식가(노출) 규칙", ["상시=공식", "상시 위에 정가 프레이밍 추가"], index=1)
+    official_margin_over_always = st.slider("정가 프레이밍(%): 공식가=상시*(1+%)", 0, 80, 20, 1) / 100.0
 
     st.divider()
-    st.header("홈쇼핑 기간(온라인 카니발 방지)")
-    hs_enable = st.checkbox("홈쇼핑 기간 운영가 계산", value=True)
-    hs_start = st.date_input("홈쇼핑 시작일", value=date.today())
-    hs_end = st.date_input("홈쇼핑 종료일", value=date.today())
-    hs_uplift_pct = st.number_input("홈쇼핑가 대비 온라인 최소 +%(업)", min_value=0.0, max_value=300.0, value=10.0, step=0.5)
+    st.header("온라인 레벨 사다리(기본 비율)")
+    st.caption("공구 기반 사다리용(1안/2안 공통). 네 데이터 패턴에 맞춘 기본값.")
+    a = st.slider("모바일라방: 공구 대비 +%", 0, 30, 5, 1) / 100.0
+    b = st.slider("행사/브위: 공구 대비 +%", 0, 80, 25, 1) / 100.0
+    c = st.slider("상시: 공구 대비 +%", 0, 120, 60, 1) / 100.0
 
-st.subheader("채널 입력")
-channels_df = st.data_editor(
-    st.session_state["channels_df"],
+    if engine.startswith("1안"):
+        st.divider()
+        st.header("1안 파라미터")
+        hs_premium_over_G = st.slider("홈쇼핑: 공구 대비 +% (공구가 더 싸게)", 0, 20, 5, 1) / 100.0
+
+    if engine.startswith("2안") or engine.startswith("3안"):
+        st.divider()
+        st.header("2안 파라미터(홈쇼핑 기반)")
+        d = st.slider("공구가: 홈쇼핑 대비 -% (공구가 더 싸게)", 0, 20, 4, 1) / 100.0
+        u = st.slider("온라인 하한: 홈쇼핑 대비 +% (카니발 방지)", 0, 60, 15, 1) / 100.0
+
+    if engine.startswith("3안"):
+        st.divider()
+        st.header("3안 Guardrail(마진/비용)")
+        st.caption("채널별 최소 허용가(=원가 방어) 적용 후 룰 가격을 끌어올립니다.")
+        min_margin_pct = st.slider("최소 마진(%)", 0, 50, 15, 1) / 100.0
+        fee_online = st.slider("온라인 채널비용율(수수료+프로모션+반품)", 0, 60, 20, 1) / 100.0
+        fee_groupbuy = st.slider("공구 채널비용율", 0, 60, 15, 1) / 100.0
+        fee_hs = st.slider("홈쇼핑 채널비용율", 0, 80, 35, 1) / 100.0
+
+# Main: product input
+st.subheader("상품 입력(배치)")
+st.caption("구성수량(Q)은 '세트가→단위가' 환산에 사용. 비어있으면 상품명에서 숫자 힌트를 자동 제안합니다(가능할 때만).")
+
+products_df = st.data_editor(
+    st.session_state["products_df"],
     num_rows="dynamic",
     use_container_width=True,
     column_config={
-        "채널": st.column_config.TextColumn(required=True),
-        "채널구분": st.column_config.SelectboxColumn("채널구분", options=["온라인", "공구", "홈쇼핑", "기타"], required=True),
-        "고정가(원)": st.column_config.NumberColumn(help="공구/홈쇼핑/기타는 여기 입력값만 사용(온라인은 비워도 됨).", step=100),
-        "수수료율": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.01),
-        "프로모션율": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.01),
-        "반품율": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.01),
+        "브랜드": st.column_config.TextColumn(required=True),
+        "상품명": st.column_config.TextColumn(required=True),
+        "구분": st.column_config.SelectboxColumn(options=["단품", "세트"], required=True),
+        "구성수량(Q)": st.column_config.NumberColumn(min_value=1, step=1, help="세트 구성 수량(병/개/박스 등)."),
+        "랜디드코스트(총원가)": st.column_config.NumberColumn(min_value=0, step=10),
+        "홈쇼핑가(세트가)": st.column_config.NumberColumn(min_value=0, step=100),
+        "공구가(세트가)": st.column_config.NumberColumn(min_value=0, step=100),
+        "공식가(세트가)": st.column_config.NumberColumn(min_value=0, step=100, help="2-Anchor 방식(홈쇼핑+공식가)을 쓰고 싶을 때 활용. 엔진에 따라 사용/무시됩니다."),
     },
 )
-st.session_state["channels_df"] = channels_df
+st.session_state["products_df"] = products_df
 
-st.subheader("온라인 가격레벨 할인율 밴드(온라인에만 적용)")
-ladder_df = st.data_editor(
-    st.session_state["ladder_df"],
-    num_rows="fixed",
-    use_container_width=True,
-    column_config={
-        "가격타입": st.column_config.TextColumn(disabled=True),
-        "MinDisc%": st.column_config.NumberColumn(help="최소 할인율(=가격 상단 Max)", min_value=0.0, max_value=95.0, step=0.5),
-        "TargetDisc%": st.column_config.NumberColumn(help="목표 할인율(=대표 운영가 Target)", min_value=0.0, max_value=95.0, step=0.5),
-        "MaxDisc%": st.column_config.NumberColumn(help="최대 할인율(=가격 하단 Min)", min_value=0.0, max_value=95.0, step=0.5),
-    },
-)
-st.session_state["ladder_df"] = ladder_df
+# Auto-suggest Q if blank or 0
+df = products_df.copy()
+if "구성수량(Q)" not in df.columns:
+    df["구성수량(Q)"] = 1
 
-st.subheader("리서치 입력(온라인 공식가 산정용)")
-c1, c2, c3 = st.columns(3)
+suggested = []
+for i, r in df.iterrows():
+    q = safe_float(r.get("구성수량(Q)"), np.nan)
+    if not np.isnan(q) and q >= 1:
+        suggested.append(int(q))
+        continue
+    hint = parse_units_from_text(str(r.get("상품명", "")))
+    suggested.append(int(hint) if hint else 1)
+df["구성수량(Q)"] = suggested
 
-market_mid = market_high = None
-market_pos = "중앙"
-comp_list_mid = comp_list_high = None
-comp_list_pos = "중간"
-target_margin_for_list_pct = None
+# Compute
+def compute_all(df_in: pd.DataFrame) -> pd.DataFrame:
+    rows = []
 
-with c1:
-    if engine_name == "시장앵커형":
-        market_mid = st.number_input("국내 시장가 중앙/평균(원)", min_value=0, value=39000, step=500)
-        market_high = st.number_input("국내 시장가 상단(원)", min_value=0, value=49000, step=500)
-        market_pos = st.selectbox("공식가 포지션", ["중앙", "중상", "상단"], index=1)
-    else:
-        st.caption("시장앵커형일 때만 필요")
+    for _, r in df_in.iterrows():
+        brand = str(r.get("브랜드", "")).strip()
+        name = str(r.get("상품명", "")).strip()
+        q = max(1, int(safe_float(r.get("구성수량(Q)"), 1)))
+        landed_total = safe_float(r.get("랜디드코스트(총원가)"), 0.0)
+        unit_cost = landed_total / q if q > 0 else 0.0
 
-with c2:
-    if engine_name == "정가앵커형":
-        comp_list_mid = st.number_input("경쟁 정가 중앙/평균(원)", min_value=0, value=49000, step=500)
-        comp_list_high = st.number_input("경쟁 정가 상단(원)", min_value=0, value=59000, step=500)
-        comp_list_pos = st.selectbox("우리 공식가 포지션", ["비슷", "중간", "높게"], index=1)
-    else:
-        st.caption("정가앵커형일 때만 필요")
+        hs_set = safe_float(r.get("홈쇼핑가(세트가)"), np.nan)
+        gb_set = safe_float(r.get("공구가(세트가)"), np.nan)
+        off_set = safe_float(r.get("공식가(세트가)"), np.nan)
 
-with c3:
-    if engine_name == "원가-마진형":
-        target_margin_for_list_pct = st.number_input("공식가용 목표마진(%)", min_value=0.0, max_value=90.0, value=30.0, step=0.5)
-    else:
-        st.caption("원가-마진형일 때만 필요")
+        hs_unit = hs_set / q if not np.isnan(hs_set) and q > 0 else np.nan
+        gb_unit = gb_set / q if not np.isnan(gb_set) and q > 0 else np.nan
+        off_unit = off_set / q if not np.isnan(off_set) and q > 0 else np.nan
 
-min_margin_rate = pct_to_rate(min_margin_pct)
-import_premium_rate = pct_to_rate(import_premium_pct)
-target_margin_for_list_rate = pct_to_rate(target_margin_for_list_pct) if target_margin_for_list_pct is not None else None
+        # ---- Engine-specific: generate unit targets ----
+        if engine.startswith("1안"):
+            # Need 공구가
+            if np.isnan(gb_unit):
+                continue
+            unit_prices = engine1_groupbuy_ladder(
+                unit_G=gb_unit,
+                a=a, b=b, c=c,
+                hs_premium_over_G=hs_premium_over_G
+            )
+            official_unit = derive_official_from_online(unit_prices, official_mode, official_margin_over_always)
 
-out_base = compute_prices(
-    landed_cost=float(landed_cost),
-    min_margin_rate=min_margin_rate,
-    channels_df=channels_df,
-    ladder_df=ladder_df,
-    engine_name=engine_name,
-    list_price_policy=list_price_policy,
-    market_mid=market_mid,
-    market_high=market_high,
-    market_pos=market_pos,
-    comp_list_mid=comp_list_mid,
-    comp_list_high=comp_list_high,
-    comp_list_pos=comp_list_pos,
-    target_margin_for_list_rate=target_margin_for_list_rate,
-    use_import_cap=use_import_cap,
-    import_ref=float(import_ref) if (use_import_cap and import_ref is not None) else None,
-    import_premium_rate=import_premium_rate,
-)
+        elif engine.startswith("2안"):
+            # Need 홈쇼핑가
+            if np.isnan(hs_unit):
+                continue
+            unit_prices = engine2_hs_floor_with_uplift(
+                unit_H=hs_unit,
+                d=d, u=u, a=a, b=b, c=c
+            )
+            official_unit = derive_official_from_online(unit_prices, official_mode, official_margin_over_always)
 
-out_hs = None
-if hs_enable:
-    out_hs = apply_hs_period_uplift(out_base, uplift_pct=float(hs_uplift_pct))
+        else:
+            # 3안: use 2안(홈쇼핑 기반)을 기본으로, 없으면 1안 fallback
+            if not np.isnan(hs_unit):
+                unit_prices = engine2_hs_floor_with_uplift(unit_H=hs_unit, d=d, u=u, a=a, b=b, c=c)
+            elif not np.isnan(gb_unit):
+                unit_prices = engine1_groupbuy_ladder(unit_G=gb_unit, a=a, b=b, c=c, hs_premium_over_G=0.05)
+            else:
+                continue
+
+            official_unit = derive_official_from_online(unit_prices, official_mode, official_margin_over_always)
+
+            # Guardrail per channel (unit basis)
+            guard_online = guardrail_min_price(unit_cost, fee_online, min_margin_pct)
+            guard_gb = guardrail_min_price(unit_cost, fee_groupbuy, min_margin_pct)
+            guard_hs = guardrail_min_price(unit_cost, fee_hs, min_margin_pct)
+
+            # Apply guardrails (targets)
+            # 공구가/홈쇼핑가/온라인레벨/공식가(노출)
+            unit_prices["공구가"] = apply_guardrail(unit_prices.get("공구가", 0), guard_gb)
+            unit_prices["홈쇼핑가"] = apply_guardrail(unit_prices.get("홈쇼핑가", 0), guard_hs)
+            for k in ONLINE_LEVELS:
+                if k in unit_prices:
+                    unit_prices[k] = apply_guardrail(unit_prices[k], guard_online)
+            official_unit = apply_guardrail(official_unit, guard_online)
+
+        # ---- Enforce ordering constraints (practical safety) ----
+        # 홈쇼핑은 최저(또는 공구가 더 싸게) 정책은 파라미터로 이미 설계됨.
+        # 온라인 레벨은 공식가 이하로 캡.
+        for k in ONLINE_LEVELS:
+            if k in unit_prices:
+                unit_prices[k] = min(unit_prices[k], official_unit)
+
+        # ---- Build output rows (set price = unit * Q), then band ----
+        # Groupbuy only
+        if "공구가" in unit_prices:
+            tgt = unit_prices["공구가"] * q
+            pmin, ptgt, pmax = make_band(tgt, band_pct, rounding_unit)
+            rows.append({"브랜드": brand, "상품명": name, "구분": r.get("구분", ""), "Q": q, "가격타입": "공구가",
+                         "Min": pmin, "Target": ptgt, "Max": pmax})
+
+        # Homeshopping only
+        if "홈쇼핑가" in unit_prices:
+            tgt = unit_prices["홈쇼핑가"] * q
+            pmin, ptgt, pmax = make_band(tgt, band_pct, rounding_unit)
+            rows.append({"브랜드": brand, "상품명": name, "구분": r.get("구분", ""), "Q": q, "가격타입": "홈쇼핑가",
+                         "Min": pmin, "Target": ptgt, "Max": pmax})
+
+        # Online only
+        tgt = official_unit * q
+        pmin, ptgt, pmax = make_band(tgt, band_pct, rounding_unit)
+        rows.append({"브랜드": brand, "상품명": name, "구분": r.get("구분", ""), "Q": q, "가격타입": "공식가(노출)",
+                     "Min": pmin, "Target": ptgt, "Max": pmax})
+
+        for k in ONLINE_LEVELS:
+            if k in unit_prices:
+                tgt = unit_prices[k] * q
+                pmin, ptgt, pmax = make_band(tgt, band_pct, rounding_unit)
+                rows.append({"브랜드": brand, "상품명": name, "구분": r.get("구분", ""), "Q": q, "가격타입": k,
+                             "Min": pmin, "Target": ptgt, "Max": pmax})
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        return out
+
+    # sort order
+    order = {"공구가": 0, "홈쇼핑가": 1, "공식가(노출)": 2}
+    for i, k in enumerate(ONLINE_LEVELS, start=3):
+        order[k] = i
+    out["__ord"] = out["가격타입"].map(order).fillna(999).astype(int)
+    out = out.sort_values(["브랜드", "상품명", "__ord"]).drop(columns="__ord").reset_index(drop=True)
+    return out
+
+out = compute_all(df)
 
 st.divider()
-st.subheader("결과 테이블: 평시(기본)")
-st.dataframe(out_base, use_container_width=True)
+st.subheader("산출 결과")
+if out.empty:
+    st.warning("필수 입력값이 부족한 상품이 있습니다. (1안은 공구가 필요 / 2안은 홈쇼핑가 필요 / 3안은 둘 중 하나 + 원가 권장)")
+else:
+    st.dataframe(out, use_container_width=True)
 
-if hs_enable and out_hs is not None:
-    st.subheader(f"결과 테이블: 홈쇼핑 기간 운영가 (기간: {hs_start} ~ {hs_end})")
-    st.caption("※ 홈쇼핑가(최저 홈쇼핑가 기준) 대비 +X% 이상으로 온라인 5레벨만 상향 적용")
-    st.dataframe(out_hs, use_container_width=True)
+    # Pivot view for quick scan (Target)
+    st.subheader("요약(타겟가 피벗)")
+    pv = out.pivot_table(index=["브랜드", "상품명"], columns="가격타입", values="Target", aggfunc="first")
+    pv = pv.reindex(columns=OTHER_TYPES + ["공식가(노출)"] + ONLINE_LEVELS, fill_value=np.nan)
+    st.dataframe(pv.reset_index(), use_container_width=True)
 
-st.divider()
-tab1, tab2 = st.tabs(["도식화: 평시(기본)", "도식화: 홈쇼핑 기간 운영가"])
+    st.divider()
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.subheader("도식화(선택 상품만)")
+        options = (out["브랜드"] + " | " + out["상품명"]).drop_duplicates().tolist()
+        sel = st.multiselect("도식화할 상품 선택", options=options, default=options[:3])
+        if sel:
+            mask = (out["브랜드"] + " | " + out["상품명"]).isin(sel)
+            render_range_bars(out[mask], "가격 범위 도식화 (Min / Target / Max)")
+        else:
+            st.info("상품을 선택하면 도식화가 나옵니다.")
+    with c2:
+        st.subheader("룰 빠른 점검")
+        st.write("현재 엔진:", engine)
+        st.write("밴드폭:", f"{band_pct}%")
+        st.write("반올림:", f"{rounding_unit:,}원")
 
-with tab1:
-    render_range_bars(out_base, "평시(기본) 가격 범위 도식화")
-
-with tab2:
-    if hs_enable and out_hs is not None:
-        render_range_bars(out_hs, f"홈쇼핑 기간 운영가 도식화 (+{hs_uplift_pct}% 룰)")
-    else:
-        st.info("홈쇼핑 기간 운영가 계산을 켜면 표시됩니다.")
+        with st.expander("⚠️ 체크 포인트(자동 경고는 다음 단계에 추가 가능)"):
+            st.markdown(
+                """
+- **1안**: 공구가 입력이 없으면 계산 불가  
+- **2안**: 홈쇼핑가 입력이 없으면 계산 불가  
+- **3안**: 홈쇼핑가가 있으면 그걸 우선 사용, 없으면 공구가로 대체  
+- **공식가(노출)**는 온라인에만 생성됩니다.
+- **공구/홈쇼핑에는 온라인 용어가 절대 생성되지 않습니다.**
+                """
+            )
