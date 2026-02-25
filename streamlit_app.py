@@ -4,7 +4,7 @@ import numpy as np
 from io import BytesIO
 
 # ============================================================
-# IBR Pricing Simulator v6.1 (Cost-only → Auto prices → You adjust)
+# IBR Pricing Simulator v6.2 (Cost-only → Auto prices → You adjust)
 #
 # ✅ 원가 파일(상품명 통일 + 원가)만 업로드하면:
 #   - SKU별 레인지(Min~Max=MSRP) 자동 생성
@@ -15,10 +15,16 @@ from io import BytesIO
 #   - Min(최저가), Max(최고가/MSRP)를 수동으로 올리거나 내릴 수 있음 → 전체 가격이 같이 이동
 #   - 특정 가격영역(채널)의 가격을 직접 override 가능(룰 위반도 허용) → 경고만 표시
 #   - 마진(기여이익/기여이익률)과 Floor(손익하한) 침범 여부를 즉시 확인
-#   - 세트는 앱에서 BOM(구성품 리스트업) → 자동 추천가 + 구성품별 실질단가/할인율 + 카니발 체크
+#
+# ✅ v6.2 세트 로직(v2)
+#   - 세트 타입 자동 인식: 멀티/믹스/선물(부자재 SKU 포함)
+#   - 세트 MSRP/Max 후보에 "구성품 MSRP 합(추정) × k" 추가
+#   - 세트 Target은 밴드중앙이 아니라 BASE(구성품 상시합)×(1-Disc)로 산출
+#   - 구성품 환산 단가(개당 얼마): 부자재 0가중 + 히어로 부스트
+#   - 래더(1/2/4 · 1/3/6 · 1/4/8) 자동 추천 + 가운데 옵션 혜택 강화
 # ============================================================
 
-st.set_page_config(page_title="IBR Pricing Simulator v6.1", layout="wide")
+st.set_page_config(page_title="IBR Pricing Simulator v6.2", layout="wide")
 
 PRICE_ZONES = ["공구", "홈쇼핑", "폐쇄몰", "모바일라방", "원데이", "브랜드위크", "홈사", "상시", "오프라인", "MSRP"]
 
@@ -56,6 +62,50 @@ def default_zone_target_pos(boundaries):
     for i, z in enumerate(PRICE_ZONES):
         out[z] = (boundaries[i] + boundaries[i+1]) / 2
     return out
+
+# -----------------------------
+# Set Pricing v2 Defaults
+# -----------------------------
+GIFT_KEYWORDS = ["쇼핑백", "트레이", "틴케이스", "스푼", "선물", "기프트", "포장", "케이스"]
+
+SET_TYPES = ["multi", "assort", "gift"]
+
+def make_default_set_disc_df():
+    rows = []
+    # % 할인율 (Base 대비) - 초기값(튜닝 전제)
+    defaults = {
+        "multi": {
+            "공구": 45, "홈쇼핑": 55, "폐쇄몰": 35, "모바일라방": 40, "원데이": 30,
+            "브랜드위크": 25, "홈사": 25, "상시": 3, "오프라인": 0, "MSRP": 0
+        },
+        "assort": {
+            "공구": 42, "홈쇼핑": 55, "폐쇄몰": 33, "모바일라방": 38, "원데이": 28,
+            "브랜드위크": 23, "홈사": 23, "상시": 10, "오프라인": 5, "MSRP": 0
+        },
+        "gift": {
+            "공구": 45, "홈쇼핑": 58, "폐쇄몰": 35, "모바일라방": 40, "원데이": 30,
+            "브랜드위크": 25, "홈사": 25, "상시": 12, "오프라인": 5, "MSRP": 0
+        },
+    }
+    for stype in SET_TYPES:
+        for z in PRICE_ZONES:
+            rows.append({
+                "세트타입": stype,
+                "가격영역": z,
+                "할인율(%)": defaults[stype].get(z, 0)
+            })
+    return pd.DataFrame(rows)
+
+DEFAULT_SET_PARAMS = {
+    "k_msrp_set_multi": 1.00,
+    "k_msrp_set_assort": 0.98,
+    "k_msrp_set_gift": 1.03,         # 가치연출(선물세트)용
+    "pack_cost_default": 0.0,
+    "pack_cost_gift": 700.0,         # 선물세트 포장/동봉비(기본)
+    "disc_pack_step_pct": 2.0,       # 팩사이즈(수량) 증가 시 할인율 가산(%p)
+    "disc_pack_cap_pct": 6.0,        # 가산 상한(%p)
+    "hero_boost": 0.6,               # 구성품 환산 배분에서 히어로 가중치 부스트
+}
 
 # -----------------------------
 # Utilities
@@ -238,7 +288,7 @@ def compute_auto_range_from_cost(
     return min_auto, max_auto, {"note": note, "msrp_base": msrp_base}
 
 # -----------------------------
-# Build zone table with adjustable Min/Max and optional overrides
+# Build zone table with adjustable Min/Max and optional overrides (SKU)
 # -----------------------------
 def build_zone_table(
     cost_total: float,
@@ -385,33 +435,373 @@ def check_order_violations(zdf: pd.DataFrame, gap_pct: float, gap_won: float):
     return pd.DataFrame(viol)
 
 # -----------------------------
-# Set helpers
+# Set helpers (v2)
 # -----------------------------
-def compute_set_cost(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame) -> float:
+def is_accessory_sku(sku: str, name: str, cost: float) -> bool:
+    sku = str(sku or "")
+    name = str(name or "")
+    if sku.upper().startswith("U"):
+        return True
+    for kw in GIFT_KEYWORDS:
+        if kw in name:
+            return True
+    # 저원가 휴리스틱(원가만 있고 가격 앵커로 쓰면 왜곡되는 케이스 방지)
+    try:
+        if float(cost) > 0 and float(cost) <= 800:
+            return True
+    except Exception:
+        pass
+    return False
+
+def classify_set(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame):
+    b = bom_df[bom_df["세트ID"] == set_id].copy()
+    if b.empty:
+        return {"set_type":"assort", "is_gift":False, "total_units":0, "non_acc_units":0, "unique_non_acc_skus":0, "hero_sku":None}
+
+    b["수량"] = pd.to_numeric(b["수량"], errors="coerce").fillna(0).astype(int)
+    b = b.merge(products_df[["품번","상품명","원가"]], on="품번", how="left")
+    b["원가"] = pd.to_numeric(b["원가"], errors="coerce").fillna(0.0)
+
+    b["is_acc"] = b.apply(lambda r: is_accessory_sku(r["품번"], r.get("상품명",""), r.get("원가",0)), axis=1)
+    total_units = int(b["수량"].sum())
+    non_acc = b[~b["is_acc"]].copy()
+    non_acc_units = int(non_acc["수량"].sum())
+    unique_non_acc = int(non_acc["품번"].nunique())
+
+    is_gift = bool(b["is_acc"].any())
+
+    if unique_non_acc <= 1 and non_acc_units > 0:
+        base_type = "multi"
+    else:
+        base_type = "assort"
+
+    set_type = "gift" if is_gift else base_type
+
+    # 히어로 SKU: 비부자재 중 원가 높은 SKU
+    hero_sku = None
+    if not non_acc.empty:
+        non_acc2 = non_acc.sort_values("원가", ascending=False)
+        hero_sku = str(non_acc2.iloc[0]["품번"])
+
+    return {
+        "set_type": set_type,
+        "is_gift": is_gift,
+        "total_units": total_units,
+        "non_acc_units": non_acc_units,
+        "unique_non_acc_skus": unique_non_acc,
+        "hero_sku": hero_sku,
+        "detail_df": b
+    }
+
+def estimate_sku_msrp_from_cost(sku: str, cost: float, channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio):
+    """원가만 있을 때 SKU의 Max(=MSRP) 추정치(기존 compute_auto_range_from_cost의 max를 사용)"""
+    if cost != cost or cost <= 0:
+        return np.nan
+    _, max_auto, _ = compute_auto_range_from_cost(
+        cost_total=cost,
+        channels_df=channels_df,
+        zone_map=zone_map,
+        boundaries=boundaries,
+        rounding_unit=rounding_unit,
+        min_cm=min_cm,
+        max_cost_ratio=max_cost_ratio,
+        include_zones=PRICE_ZONES,
+        min_zone="공구",
+        msrp_override=np.nan
+    )
+    return float(max_auto) if max_auto == max_auto else np.nan
+
+def compute_set_cost_v2(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame, pack_cost: float):
     b = bom_df[bom_df["세트ID"] == set_id].copy()
     if b.empty:
         return np.nan
     b["수량"] = pd.to_numeric(b["수량"], errors="coerce").fillna(0).astype(int)
     b = b.merge(products_df[["품번","원가"]], on="품번", how="left")
     b["원가"] = pd.to_numeric(b["원가"], errors="coerce").fillna(0.0)
-    return float((b["원가"] * b["수량"]).sum())
+    return float((b["원가"] * b["수량"]).sum() + float(pack_cost or 0.0))
 
-def allocate_set_price_to_components(set_id, zone, set_price, products_df, bom_df, sku_always_prices):
+def get_set_disc_pct(set_type: str, zone: str, pack_units: int, disc_df: pd.DataFrame, params: dict):
+    """세트 할인율(%) = 테이블 + 팩사이즈 가산(로그/완만 증가)"""
+    base = 0.0
+    try:
+        rr = disc_df[(disc_df["세트타입"]==set_type) & (disc_df["가격영역"]==zone)]
+        if not rr.empty:
+            base = float(rr.iloc[0]["할인율(%)"])
+    except Exception:
+        base = 0.0
+
+    step = float(params.get("disc_pack_step_pct", 2.0))
+    cap = float(params.get("disc_pack_cap_pct", 6.0))
+    if pack_units is None or pack_units <= 1:
+        add = 0.0
+    else:
+        add = min(cap, step * np.log2(pack_units))
+    return max(0.0, min(95.0, base + add))
+
+def compute_set_anchors_v2(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame,
+                           channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio,
+                           sku_always_prices: dict, params: dict):
+    """세트 앵커(Base/MSRP_sum) 계산: 부자재는 Base에 0원 처리"""
+    cls = classify_set(set_id, bom_df, products_df)
+    b = cls.get("detail_df", pd.DataFrame()).copy()
+    if b.empty:
+        return None
+
+    set_type = cls["set_type"]
+    pack_cost = float(params.get("pack_cost_gift", 700.0)) if set_type=="gift" else float(params.get("pack_cost_default", 0.0))
+
+    # base_sum: 구성품 상시 합(부자재 0원)
+    b["is_acc"] = b.apply(lambda r: is_accessory_sku(r["품번"], r.get("상품명",""), r.get("원가",0)), axis=1)
+    b["상시_ref"] = b["품번"].astype(str).map(sku_always_prices).astype(float).fillna(0.0)
+    b.loc[b["is_acc"], "상시_ref"] = 0.0
+    b["base_value"] = b["상시_ref"] * b["수량"]
+    base_sum = float(b["base_value"].sum())
+
+    # msrp_sum: 구성품 MSRP 합(부자재 0원). SKU MSRP가 없으므로 원가 기반 Max로 추정
+    msrp_list = []
+    for _, r in b.iterrows():
+        sku = str(r["품번"])
+        qty = int(r["수량"])
+        if bool(r["is_acc"]):
+            msrp_list.append(0.0)
+            continue
+        sku_cost = safe_float(r.get("원가", np.nan), np.nan)
+        sku_msrp_est = estimate_sku_msrp_from_cost(
+            sku, sku_cost, channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio
+        )
+        if sku_msrp_est != sku_msrp_est:
+            sku_msrp_est = 0.0
+        msrp_list.append(float(sku_msrp_est) * qty)
+    msrp_sum = float(np.sum(msrp_list))
+
+    # k_msrp_set
+    if set_type == "multi":
+        k = float(params.get("k_msrp_set_multi", 1.00))
+    elif set_type == "assort":
+        k = float(params.get("k_msrp_set_assort", 0.98))
+    else:
+        k = float(params.get("k_msrp_set_gift", 1.03))
+
+    msrp_set_sum = msrp_sum * k
+
+    pack_units = int(cls.get("non_acc_units", 0)) if cls else 0
+
+    # base_sum이 0이면(상시_ref 부족) msrp_sum 기반 임시 대체(보수적)
+    if base_sum <= 0 and msrp_sum > 0:
+        base_sum = msrp_sum * 0.85
+
+    return {
+        "set_type": set_type,
+        "pack_cost": pack_cost,
+        "pack_units": pack_units if pack_units > 0 else 1,
+        "base_sum": base_sum,
+        "msrp_sum_est": msrp_sum,
+        "msrp_set_sum": msrp_set_sum,
+        "hero_sku": cls.get("hero_sku", None),
+        "detail_df": b
+    }
+
+def compute_set_range_v2(cost_total: float, anchors: dict, channels_df, zone_map, boundaries,
+                         rounding_unit: int, min_cm: float, max_cost_ratio: float, include_zones: list,
+                         min_zone: str = "공구", msrp_override=np.nan):
+    """
+    세트 레인지: 기존 로직 + Max 후보에 msrp_set_sum(=구성품MSRP합*k) 추가
+    """
+    min_auto, max_auto_cost, meta = compute_auto_range_from_cost(
+        cost_total=cost_total,
+        channels_df=channels_df,
+        zone_map=zone_map,
+        boundaries=boundaries,
+        rounding_unit=rounding_unit,
+        min_cm=min_cm,
+        max_cost_ratio=max_cost_ratio,
+        include_zones=include_zones,
+        min_zone=min_zone,
+        msrp_override=np.nan
+    )
+
+    candidates = []
+    if max_auto_cost == max_auto_cost:
+        candidates.append(float(max_auto_cost))
+    if anchors and anchors.get("msrp_set_sum", np.nan) == anchors.get("msrp_set_sum", np.nan):
+        candidates.append(float(anchors["msrp_set_sum"]))
+    if msrp_override == msrp_override and msrp_override > 0:
+        candidates.append(float(msrp_override))
+
+    max_auto = krw_ceil(max(candidates), rounding_unit) if candidates else max_auto_cost
+    return float(min_auto), float(max_auto), meta
+
+def build_zone_table_set_v2(cost_total: float, min_price: float, max_price: float,
+                            anchors: dict, channels_df: pd.DataFrame, zone_map: dict, boundaries: list,
+                            rounding_unit: int, min_cm: float, overrides_df: pd.DataFrame,
+                            disc_df: pd.DataFrame, params: dict, item_id: str):
+    """
+    세트 v2: Target = base_sum * (1 - Disc) 기반으로 계산 후
+    Floor/Band로 클램프. MSRP 영역은 max_price 고정.
+    """
+    ch_map = channels_df.set_index("채널명").to_dict("index")
+    rows = []
+    if min_price != min_price or max_price != max_price or max_price <= min_price:
+        return pd.DataFrame()
+    if anchors is None:
+        return pd.DataFrame()
+
+    set_type = anchors["set_type"]
+    base_sum = float(anchors.get("base_sum", 0.0))
+    pack_units = int(anchors.get("pack_units", 1))
+
+    span = max_price - min_price
+
+    for i, z in enumerate(PRICE_ZONES):
+        start = boundaries[i] / 100.0
+        end = boundaries[i+1] / 100.0
+        band_low = min_price + span * start
+        band_high = min_price + span * end
+
+        ch = zone_map.get(z, "자사몰")
+        p = ch_map.get(ch, None)
+        if p is None:
+            continue
+
+        floor = floor_price(
+            cost_total=cost_total,
+            q_orders=1,
+            fee=p["수수료율"],
+            pg=p["PG"],
+            mkt=p["마케팅비"],
+            ship_per_order=p["배송비(주문당)"],
+            ret_rate=p["반품률"],
+            ret_cost_order=p["반품비(주문당)"],
+            min_cm=min_cm
+        )
+
+        status = "OK"
+
+        if z == "MSRP":
+            target = max_price
+            disc_pct = 0.0
+        else:
+            disc_pct = get_set_disc_pct(set_type, z, pack_units, disc_df, params)
+            target_raw = base_sum * (1.0 - disc_pct / 100.0)
+            target = max(target_raw, floor)
+
+            if floor > band_high:
+                status = "불가(Floor>BandHigh)"
+                target = band_high
+            else:
+                if target > band_high:
+                    status = "클립(Target→BandHigh)"
+                    target = band_high
+                if target < band_low:
+                    status = "클립(Target→BandLow)"
+                    target = band_low
+
+        ov = overrides_df[
+            (overrides_df["오퍼타입"] == "SET") &
+            (overrides_df["오퍼ID"] == item_id) &
+            (overrides_df["가격영역"] == z)
+        ]
+        override_price = np.nan
+        if not ov.empty:
+            override_price = safe_float(ov.iloc[0]["가격_오버라이드"], np.nan)
+
+        effective = override_price if (override_price == override_price and override_price > 0) else target
+
+        band_low_r = krw_round(band_low, rounding_unit)
+        band_high_r = krw_round(band_high, rounding_unit)
+        floor_r = krw_round(floor, rounding_unit)
+        target_r = krw_round(target, rounding_unit)
+        eff_r = krw_round(effective, rounding_unit) if (effective == effective and effective > 0) else np.nan
+
+        cm, cmr = contrib_metrics(
+            price=eff_r if eff_r == eff_r else 0,
+            cost_total=cost_total,
+            q_orders=1,
+            fee=p["수수료율"],
+            pg=p["PG"],
+            mkt=p["마케팅비"],
+            ship_per_order=p["배송비(주문당)"],
+            ret_rate=p["반품률"],
+            ret_cost_order=p["반품비(주문당)"]
+        )
+
+        flags = []
+        if eff_r == eff_r and eff_r < floor_r:
+            flags.append("⚠️Floor 미만(손익 위험)")
+        if eff_r == eff_r and eff_r < band_low_r:
+            flags.append("⚠️BandLow 미만")
+        if eff_r == eff_r and eff_r > band_high_r and z != "MSRP":
+            flags.append("⚠️BandHigh 초과")
+
+        rows.append({
+            "가격영역": z,
+            "세트타입": set_type,
+            "팩수량(부자재제외)": pack_units,
+            "Disc(%)": round(float(disc_pct), 1),
+            "비용채널": ch,
+            "BandLow": band_low_r,
+            "BandHigh": band_high_r,
+            "Floor(손익하한)": floor_r,
+            "추천가(Target)": target_r,
+            "가격_오버라이드(원)": (krw_round(override_price, rounding_unit) if override_price == override_price else np.nan),
+            "최종가격(원)": eff_r,
+            "상태": status,
+            "경고": " / ".join(flags),
+            "마진룸(원)=최종-Floor": (eff_r - floor_r) if (eff_r == eff_r) else np.nan,
+            "기여이익(원)": int(round(cm)) if cm == cm else np.nan,
+            "기여이익률(%)": round(cmr*100, 1) if cmr == cmr else np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+def allocate_set_price_to_components_v2(set_id, zone, set_price, products_df, bom_df, sku_always_prices,
+                                       hero_sku=None, hero_boost=0.0):
+    """
+    구성품 환산 단가(개당 얼마):
+    - 가중치 = 상시가_ref * 수량
+    - 부자재(U* / 키워드 / 저원가)은 가중치 0
+    - hero_sku는 가중치 (1+hero_boost) 배
+    """
     b = bom_df[bom_df["세트ID"] == set_id].copy()
     if b.empty:
         return pd.DataFrame()
     b["수량"] = pd.to_numeric(b["수량"], errors="coerce").fillna(0).astype(int)
-    b = b.merge(products_df[["품번","상품명"]], on="품번", how="left")
+    b = b.merge(products_df[["품번","상품명","원가"]], on="품번", how="left")
+    b["원가"] = pd.to_numeric(b["원가"], errors="coerce").fillna(0.0)
+
     b["상시가_ref"] = b["품번"].astype(str).map(sku_always_prices).astype(float).fillna(0.0)
+    b["is_acc"] = b.apply(lambda r: is_accessory_sku(r["품번"], r.get("상품명",""), r.get("원가",0)), axis=1)
+    b.loc[b["is_acc"], "상시가_ref"] = 0.0
+
     b["ref_value"] = b["상시가_ref"] * b["수량"]
+
+    if hero_sku:
+        hero_sku = str(hero_sku)
+        b.loc[b["품번"].astype(str)==hero_sku, "ref_value"] = b.loc[b["품번"].astype(str)==hero_sku, "ref_value"] * (1.0 + float(hero_boost))
+
     total_ref = float(b["ref_value"].sum())
-    b["w"] = (b["ref_value"] / total_ref) if total_ref > 0 else (1.0 / len(b))
-    b["배분매출"] = set_price * b["w"]
+    if total_ref <= 0:
+        non_acc = b[~b["is_acc"]].copy()
+        if non_acc.empty:
+            b["w"] = 1.0 / len(b)
+        else:
+            b["w"] = 0.0
+            b.loc[~b["is_acc"], "w"] = 1.0 / len(non_acc)
+    else:
+        b["w"] = b["ref_value"] / total_ref
+
+    b["배분매출"] = float(set_price) * b["w"]
     b["실질단가"] = b["배분매출"] / b["수량"].replace(0, np.nan)
-    b["상시대비할인율(%)"] = np.where(b["상시가_ref"]>0, (1.0 - (b["실질단가"] / b["상시가_ref"])) * 100.0, np.nan)
+
+    b["상시대비할인율(%)"] = np.where(
+        b["상시가_ref"]>0,
+        (1.0 - (b["실질단가"] / b["상시가_ref"])) * 100.0,
+        np.nan
+    )
     b["세트ID"] = set_id
     b["가격영역"] = zone
-    return b[["세트ID","가격영역","품번","상품명","수량","상시가_ref","실질단가","상시대비할인율(%)"]]
+
+    return b[["세트ID","가격영역","품번","상품명","수량","상시가_ref","실질단가","상시대비할인율(%)","is_acc"]]
 
 # -----------------------------
 # Session state init
@@ -434,11 +824,15 @@ if "plan_df" not in st.session_state:
     st.session_state["plan_df"] = pd.DataFrame(columns=["가격영역","오퍼타입","오퍼ID","가격_오버라이드"])
 if "overrides_df" not in st.session_state:
     st.session_state["overrides_df"] = pd.DataFrame(columns=["오퍼타입","오퍼ID","가격영역","가격_오버라이드"])
+if "set_disc_df" not in st.session_state:
+    st.session_state["set_disc_df"] = make_default_set_disc_df()
+if "set_params" not in st.session_state:
+    st.session_state["set_params"] = DEFAULT_SET_PARAMS.copy()
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("IBR 가격 시뮬레이터 v6.1")
+st.title("IBR 가격 시뮬레이터 v6.2")
 st.caption("원가만 업로드 → 자동 가격 생성 → Min/Max/채널별 가격은 사용자가 수정(룰 위반 가능) → 마진/카니발은 경고로 표시")
 
 tab_up, tab_sku, tab_set, tab_plan, tab_logic = st.tabs(
@@ -503,7 +897,7 @@ with tab_up:
     new_b.append(100)
     st.session_state["boundaries"] = new_b
 
-    with st.expander("각 영역 내 Target 위치(%) (기본=중앙)", expanded=False):
+    with st.expander("각 영역 내 Target 위치(%) (기본=중앙) — SKU 전용", expanded=False):
         tp = st.session_state["target_pos"].copy()
         cols = st.columns(5)
         for i, z in enumerate(PRICE_ZONES):
@@ -570,7 +964,6 @@ with tab_sku:
             if meta.get("note"):
                 st.info(meta["note"])
 
-            # User adjustments (THIS is what you asked for)
             c1, c2, c3 = st.columns([1,1,2])
             with c1:
                 min_user = st.number_input("Min(최저가) 수정", min_value=0, value=int(min_auto), step=rounding_unit)
@@ -600,7 +993,6 @@ with tab_sku:
                 item_id=sku,
             )
 
-            # Editable overrides per zone (user can break rules)
             st.markdown("### 채널별 가격 수정(오버라이드) — 룰 위반 허용, 경고만 표시")
             if zdf.empty:
                 st.info("결과가 없습니다.")
@@ -609,11 +1001,8 @@ with tab_sku:
                 edit_view = zdf[edit_cols].copy()
                 edit_view = st.data_editor(edit_view, use_container_width=True, height=260, num_rows="fixed", key="sku_override_editor")
 
-                # write back overrides
                 ov = st.session_state["overrides_df"].copy()
-                # remove existing overrides for this sku
                 ov = ov[~((ov["오퍼타입"]=="SKU") & (ov["오퍼ID"]==sku))].copy()
-                # add new ones
                 for _, rr in edit_view.iterrows():
                     p = safe_float(rr.get("가격_오버라이드(원)"), np.nan)
                     if p == p and p > 0:
@@ -625,7 +1014,6 @@ with tab_sku:
                         }])], ignore_index=True)
                 st.session_state["overrides_df"] = ov
 
-                # rebuild to reflect overrides
                 zdf = build_zone_table(
                     cost_total=cost,
                     min_price=float(min_user),
@@ -643,7 +1031,6 @@ with tab_sku:
 
                 st.dataframe(zdf, use_container_width=True, height=360)
 
-                # order violations
                 viol = check_order_violations(zdf, gap_pct=gap_pct, gap_won=gap_won)
                 if not viol.empty:
                     st.warning("서열/갭 위반(카니발 위험 가능성) — 허용은 되지만 참고용 경고입니다.")
@@ -658,7 +1045,7 @@ with tab_sku:
 # 3) Set (BOM)
 # =============================
 with tab_set:
-    st.subheader("세트(BOM): 앱에서 구성하면 자동 추천가 + 구성품 배분단가/할인율")
+    st.subheader("세트(BOM): 구성하면 자동 추천가 + 구성품 환산단가/할인율(개당 얼마) + 래더 추천")
     prod = st.session_state["products_df"].copy()
     if prod.empty:
         st.warning("원가 파일을 먼저 업로드하세요.")
@@ -687,7 +1074,6 @@ with tab_set:
             picked = st.selectbox("편집할 세트 선택", set_opts, index=0)
             set_id = picked.split(" | ",1)[0].strip()
 
-            # BOM add
             st.markdown("### BOM(구성품) 추가")
             sku_opts = (prod["품번"].astype(str) + " | " + prod["상품명"].astype(str)).tolist()
             a1,a2,a3 = st.columns([3,1,1])
@@ -708,6 +1094,7 @@ with tab_set:
                 st.info("BOM이 비어있습니다.")
             else:
                 bom_view = bom_view.merge(prod[["품번","상품명","원가"]], on="품번", how="left")
+                bom_view["is_acc(부자재)"] = bom_view.apply(lambda r: is_accessory_sku(r["품번"], r.get("상품명",""), r.get("원가",0)), axis=1)
                 st.dataframe(bom_view, use_container_width=True, height=220)
 
             if st.button("이 세트 BOM 전체 삭제", type="secondary", key=f"bom_clear_{set_id}"):
@@ -717,7 +1104,7 @@ with tab_set:
                 st.success("삭제 완료")
 
             st.divider()
-            st.markdown("### 세트 추천가(자동) → Min/Max/채널가격 수정")
+            st.markdown("### 세트 추천가(v2): BASE×(1-Disc) → Floor/Band 클램프 → 오버라이드 가능")
             p1, p2, p3, p4 = st.columns([1,1,1,1])
             with p1:
                 rounding_unit = st.selectbox("반올림 단위", [10,100,1000], index=2, key="set_round")
@@ -732,91 +1119,13 @@ with tab_set:
             if bom_view.empty:
                 st.info("BOM을 구성하면 자동 가격이 나옵니다.")
             else:
-                cost_total = compute_set_cost(set_id, st.session_state["bom_df"], prod)
                 srow = st.session_state["sets_df"][st.session_state["sets_df"]["세트ID"]==set_id].iloc[0]
 
-                min_auto, max_auto, meta = compute_auto_range_from_cost(
-                    cost_total=cost_total,
-                    channels_df=st.session_state["channels_df"],
-                    zone_map=st.session_state["zone_map"],
-                    boundaries=st.session_state["boundaries"],
-                    rounding_unit=rounding_unit,
-                    min_cm=min_cm,
-                    max_cost_ratio=max_cost_ratio,
-                    include_zones=PRICE_ZONES,
-                    min_zone="공구",
-                    msrp_override=safe_float(srow.get("MSRP_오버라이드", np.nan), np.nan),
-                )
-
-                st.write(f"- 세트 원가합: **{int(cost_total):,}원** | 자동 레인지: **{int(min_auto):,} ~ {int(max_auto):,}원**")
-                if meta.get("note"):
-                    st.info(meta["note"])
-
-                c1,c2,c3 = st.columns([1,1,2])
-                with c1:
-                    min_user = st.number_input("Min 수정(세트)", min_value=0, value=int(min_auto), step=rounding_unit, key="set_min_user")
-                with c2:
-                    max_user = st.number_input("Max 수정(세트)", min_value=0, value=int(max_auto), step=rounding_unit, key="set_max_user")
-                with c3:
-                    st.caption("Min/Max를 바꾸면 밴드 전체가 같이 이동합니다.")
-
-                if max_user <= min_user:
-                    max_user = min_user + max(rounding_unit*10, int(min_user*0.15))
-
-                zdf = build_zone_table(
-                    cost_total=cost_total,
-                    min_price=float(min_user),
-                    max_price=float(max_user),
-                    channels_df=st.session_state["channels_df"],
-                    zone_map=st.session_state["zone_map"],
-                    boundaries=st.session_state["boundaries"],
-                    target_pos=st.session_state["target_pos"],
-                    rounding_unit=rounding_unit,
-                    min_cm=min_cm,
-                    overrides_df=st.session_state["overrides_df"],
-                    item_type="SET",
-                    item_id=set_id,
-                )
-
-                st.markdown("#### 채널별 가격 오버라이드(세트)")
-                edit_view = zdf[["가격영역","가격_오버라이드(원)"]].copy()
-                edit_view = st.data_editor(edit_view, use_container_width=True, height=260, num_rows="fixed", key="set_override_editor")
-
-                ov = st.session_state["overrides_df"].copy()
-                ov = ov[~((ov["오퍼타입"]=="SET") & (ov["오퍼ID"]==set_id))].copy()
-                for _, rr in edit_view.iterrows():
-                    p = safe_float(rr.get("가격_오버라이드(원)"), np.nan)
-                    if p == p and p > 0:
-                        ov = pd.concat([ov, pd.DataFrame([{"오퍼타입":"SET","오퍼ID":set_id,"가격영역":rr["가격영역"],"가격_오버라이드":float(p)}])], ignore_index=True)
-                st.session_state["overrides_df"] = ov
-
-                zdf = build_zone_table(
-                    cost_total=cost_total,
-                    min_price=float(min_user),
-                    max_price=float(max_user),
-                    channels_df=st.session_state["channels_df"],
-                    zone_map=st.session_state["zone_map"],
-                    boundaries=st.session_state["boundaries"],
-                    target_pos=st.session_state["target_pos"],
-                    rounding_unit=rounding_unit,
-                    min_cm=min_cm,
-                    overrides_df=st.session_state["overrides_df"],
-                    item_type="SET",
-                    item_id=set_id,
-                )
-
-                st.dataframe(zdf, use_container_width=True, height=340)
-
-                viol = check_order_violations(zdf, gap_pct=gap_pct, gap_won=gap_won)
-                if not viol.empty:
-                    st.warning("세트 가격영역 서열/갭 위반(참고용)")
-                    st.dataframe(viol, use_container_width=True, height=200)
-
-                # Allocation (component effective unit price) for each zone
-                # Build SKU '상시' effective prices for weighting
+                # 1) 구성품 상시(ref) 산출(가중치용) - BOM에 포함된 SKU만 계산
                 sku_always = {}
-                for sku in st.session_state["bom_df"][st.session_state["bom_df"]["세트ID"]==set_id]["품번"].astype(str).unique():
-                    r = prod[prod["품번"].astype(str)==sku]
+                bom_skus = st.session_state["bom_df"][st.session_state["bom_df"]["세트ID"]==set_id]["품번"].astype(str).unique().tolist()
+                for sku_x in bom_skus:
+                    r = prod[prod["품번"].astype(str)==sku_x]
                     if r.empty:
                         continue
                     rcost = safe_float(r.iloc[0]["원가"], np.nan)
@@ -846,32 +1155,237 @@ with tab_set:
                         min_cm=min_cm,
                         overrides_df=st.session_state["overrides_df"],
                         item_type="SKU",
-                        item_id=str(sku),
+                        item_id=str(sku_x),
                     )
                     ar = z_sku[z_sku["가격영역"]=="상시"]
                     if not ar.empty:
-                        sku_always[str(sku)] = float(ar.iloc[0]["최종가격(원)"])
+                        sku_always[str(sku_x)] = float(ar.iloc[0]["최종가격(원)"])
 
-                st.markdown("#### 구성품 배분단가/할인율(상시가 가중치)")
-                alloc_rows = []
-                for _, rr in zdf.iterrows():
-                    alloc = allocate_set_price_to_components(set_id, rr["가격영역"], rr["최종가격(원)"], prod, st.session_state["bom_df"], sku_always)
-                    if not alloc.empty:
-                        alloc_rows.append(alloc)
-                if alloc_rows:
-                    alloc_df = pd.concat(alloc_rows, ignore_index=True)
-                    st.dataframe(alloc_df, use_container_width=True, height=320)
-                    xb = to_excel_bytes({"set_result": zdf, "alloc": alloc_df, "order_viol": viol})
-                    st.download_button("세트 결과 엑셀 다운로드", xb, file_name=f"{set_id}_result.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                # 2) anchors (세트 타입, BASE, MSRP_sum 추정, pack_cost)
+                anchors = compute_set_anchors_v2(
+                    set_id=set_id,
+                    bom_df=st.session_state["bom_df"],
+                    products_df=prod,
+                    channels_df=st.session_state["channels_df"],
+                    zone_map=st.session_state["zone_map"],
+                    boundaries=st.session_state["boundaries"],
+                    rounding_unit=rounding_unit,
+                    min_cm=min_cm,
+                    max_cost_ratio=max_cost_ratio,
+                    sku_always_prices=sku_always,
+                    params=st.session_state["set_params"]
+                )
+
+                if anchors is None:
+                    st.error("세트 앵커(Base/MSRP_sum) 계산 실패")
                 else:
-                    st.info("구성품 상시가(가중치) 산출이 부족해 배분 계산이 제한됩니다(구성품 원가 필요).")
+                    st.markdown("#### 세트 타입/앵커 요약(v2)")
+                    st.write({
+                        "세트타입": anchors["set_type"],
+                        "팩수량(부자재제외)": anchors["pack_units"],
+                        "pack_cost(포장/동봉비)": int(anchors["pack_cost"]),
+                        "BASE(구성품 상시합)": int(anchors["base_sum"]),
+                        "MSRP_sum_est(구성품MSRP합 추정)": int(anchors["msrp_sum_est"]),
+                        "MSRP_set_sum(×k)": int(anchors["msrp_set_sum"]),
+                        "Hero SKU": anchors.get("hero_sku")
+                    })
+
+                    with st.expander("세트 v2 파라미터(옵션) - 할인율/포장비/k/히어로부스트 조정", expanded=False):
+                        st.session_state["set_params"]["pack_cost_default"] = st.number_input("pack_cost_default", 0.0, 5000.0, float(st.session_state["set_params"]["pack_cost_default"]), 100.0, key="pc_def")
+                        st.session_state["set_params"]["pack_cost_gift"] = st.number_input("pack_cost_gift", 0.0, 5000.0, float(st.session_state["set_params"]["pack_cost_gift"]), 100.0, key="pc_gift")
+                        st.session_state["set_params"]["k_msrp_set_multi"] = st.number_input("k_msrp_set_multi", 0.80, 1.30, float(st.session_state["set_params"]["k_msrp_set_multi"]), 0.01, key="k_multi")
+                        st.session_state["set_params"]["k_msrp_set_assort"] = st.number_input("k_msrp_set_assort", 0.80, 1.30, float(st.session_state["set_params"]["k_msrp_set_assort"]), 0.01, key="k_assort")
+                        st.session_state["set_params"]["k_msrp_set_gift"] = st.number_input("k_msrp_set_gift", 0.80, 1.30, float(st.session_state["set_params"]["k_msrp_set_gift"]), 0.01, key="k_gift")
+                        st.session_state["set_params"]["disc_pack_step_pct"] = st.number_input("disc_pack_step_pct(%p)", 0.0, 10.0, float(st.session_state["set_params"]["disc_pack_step_pct"]), 0.5, key="disc_step")
+                        st.session_state["set_params"]["disc_pack_cap_pct"] = st.number_input("disc_pack_cap_pct(%p)", 0.0, 20.0, float(st.session_state["set_params"]["disc_pack_cap_pct"]), 0.5, key="disc_cap")
+                        st.session_state["set_params"]["hero_boost"] = st.number_input("hero_boost", 0.0, 2.0, float(st.session_state["set_params"]["hero_boost"]), 0.1, key="hero_boost")
+
+                        st.markdown("**세트 할인율 테이블(Disc, %)**")
+                        st.session_state["set_disc_df"] = st.data_editor(
+                            st.session_state["set_disc_df"],
+                            use_container_width=True,
+                            height=260,
+                            num_rows="dynamic",
+                            key="disc_table"
+                        )
+
+                    # 3) cost_total (+pack_cost)
+                    cost_total = compute_set_cost_v2(set_id, st.session_state["bom_df"], prod, anchors["pack_cost"])
+
+                    # 4) range v2 (Max 후보: msrp_set_sum 포함)
+                    min_auto, max_auto, meta = compute_set_range_v2(
+                        cost_total=cost_total,
+                        anchors=anchors,
+                        channels_df=st.session_state["channels_df"],
+                        zone_map=st.session_state["zone_map"],
+                        boundaries=st.session_state["boundaries"],
+                        rounding_unit=rounding_unit,
+                        min_cm=min_cm,
+                        max_cost_ratio=max_cost_ratio,
+                        include_zones=PRICE_ZONES,
+                        min_zone="공구",
+                        msrp_override=safe_float(srow.get("MSRP_오버라이드", np.nan), np.nan),
+                    )
+
+                    st.write(f"- 세트 원가합(+pack_cost): **{int(cost_total):,}원** | 자동 레인지(v2): **{int(min_auto):,} ~ {int(max_auto):,}원**")
+                    if meta.get("note"):
+                        st.info(meta["note"])
+
+                    c1,c2,c3 = st.columns([1,1,2])
+                    with c1:
+                        min_user = st.number_input("Min 수정(세트)", min_value=0, value=int(min_auto), step=rounding_unit, key="set_min_user")
+                    with c2:
+                        max_user = st.number_input("Max 수정(세트)", min_value=0, value=int(max_auto), step=rounding_unit, key="set_max_user")
+                    with c3:
+                        st.caption("v2: 세트 추천가는 BASE×(1-Disc) 기반이며, 밴드는 충돌 방지용 클램프입니다.")
+
+                    if max_user <= min_user:
+                        max_user = min_user + max(rounding_unit*10, int(min_user*0.15))
+
+                    # 5) zone table v2
+                    zdf = build_zone_table_set_v2(
+                        cost_total=cost_total,
+                        min_price=float(min_user),
+                        max_price=float(max_user),
+                        anchors=anchors,
+                        channels_df=st.session_state["channels_df"],
+                        zone_map=st.session_state["zone_map"],
+                        boundaries=st.session_state["boundaries"],
+                        rounding_unit=rounding_unit,
+                        min_cm=min_cm,
+                        overrides_df=st.session_state["overrides_df"],
+                        disc_df=st.session_state["set_disc_df"],
+                        params=st.session_state["set_params"],
+                        item_id=set_id
+                    )
+
+                    st.markdown("#### 채널별 가격 오버라이드(세트)")
+                    edit_view = zdf[["가격영역","가격_오버라이드(원)"]].copy()
+                    edit_view = st.data_editor(edit_view, use_container_width=True, height=260, num_rows="fixed", key="set_override_editor")
+
+                    ov = st.session_state["overrides_df"].copy()
+                    ov = ov[~((ov["오퍼타입"]=="SET") & (ov["오퍼ID"]==set_id))].copy()
+                    for _, rr in edit_view.iterrows():
+                        p = safe_float(rr.get("가격_오버라이드(원)"), np.nan)
+                        if p == p and p > 0:
+                            ov = pd.concat([ov, pd.DataFrame([{"오퍼타입":"SET","오퍼ID":set_id,"가격영역":rr["가격영역"],"가격_오버라이드":float(p)}])], ignore_index=True)
+                    st.session_state["overrides_df"] = ov
+
+                    # rebuild reflect overrides
+                    zdf = build_zone_table_set_v2(
+                        cost_total=cost_total,
+                        min_price=float(min_user),
+                        max_price=float(max_user),
+                        anchors=anchors,
+                        channels_df=st.session_state["channels_df"],
+                        zone_map=st.session_state["zone_map"],
+                        boundaries=st.session_state["boundaries"],
+                        rounding_unit=rounding_unit,
+                        min_cm=min_cm,
+                        overrides_df=st.session_state["overrides_df"],
+                        disc_df=st.session_state["set_disc_df"],
+                        params=st.session_state["set_params"],
+                        item_id=set_id
+                    )
+
+                    st.dataframe(zdf, use_container_width=True, height=360)
+
+                    viol = check_order_violations(zdf, gap_pct=gap_pct, gap_won=gap_won)
+                    if not viol.empty:
+                        st.warning("세트 가격영역 서열/갭 위반(참고용)")
+                        st.dataframe(viol, use_container_width=True, height=200)
+
+                    # 구성품 환산 단가(v2)
+                    st.markdown("#### 구성품 배분단가/할인율(개당 얼마) — 부자재 0가중 + 히어로 부스트")
+                    hero_sku = anchors.get("hero_sku")
+                    hero_boost = float(st.session_state["set_params"].get("hero_boost", 0.6))
+
+                    alloc_rows = []
+                    for _, rr in zdf.iterrows():
+                        alloc = allocate_set_price_to_components_v2(
+                            set_id, rr["가격영역"], rr["최종가격(원)"],
+                            prod, st.session_state["bom_df"], sku_always,
+                            hero_sku=hero_sku, hero_boost=hero_boost
+                        )
+                        if not alloc.empty:
+                            alloc_rows.append(alloc)
+
+                    if alloc_rows:
+                        alloc_df = pd.concat(alloc_rows, ignore_index=True)
+                        st.dataframe(alloc_df, use_container_width=True, height=320)
+
+                        xb = to_excel_bytes({"set_result_v2": zdf, "alloc_v2": alloc_df, "order_viol": viol})
+                        st.download_button("세트 결과 엑셀 다운로드(v2)", xb, file_name=f"{set_id}_result_v2.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    else:
+                        alloc_df = pd.DataFrame()
+                        st.info("배분 계산이 제한됩니다(구성품 상시가_ref 부족).")
+
+                    # 래더 추천(옵션)
+                    with st.expander("래더 자동 추천(1/2/4 · 1/3/6 · 1/4/8) + 가운데 옵션이 가장 혜택 있어 보이게", expanded=False):
+                        dd = anchors.get("detail_df", pd.DataFrame()).copy()
+                        if dd.empty:
+                            st.info("세트 상세가 없어 래더 추천을 생략합니다.")
+                        else:
+                            dd["is_acc"] = dd.apply(lambda r: is_accessory_sku(r["품번"], r.get("상품명",""), r.get("원가",0)), axis=1)
+                            non_acc_skus = dd.loc[~dd["is_acc"], "품번"].astype(str).unique().tolist()
+                            if not non_acc_skus:
+                                st.info("비부자재 SKU가 없어 래더 추천을 생략합니다.")
+                            else:
+                                default_hero = anchors.get("hero_sku") if anchors.get("hero_sku") in non_acc_skus else non_acc_skus[0]
+                                hero = st.selectbox("메인(히어로) SKU", non_acc_skus, index=non_acc_skus.index(default_hero), key="ladder_hero")
+                                base_single = float(sku_always.get(str(hero), 0.0))
+                                st.write(f"히어로 SKU 상시(ref) 추정: **{int(base_single):,}원**")
+
+                                def auto_ladder_family(p):
+                                    if p <= 60000:
+                                        return [1,2,4]
+                                    if p <= 110000:
+                                        return [1,3,6]
+                                    return [1,4,8]
+
+                                family_default = auto_ladder_family(base_single)
+                                fam_opt = st.selectbox("래더 구성", ["1/2/4", "1/3/6", "1/4/8"],
+                                                       index=["1/2/4","1/3/6","1/4/8"].index("/".join(map(str,family_default))),
+                                                       key="ladder_fam")
+                                ladder = list(map(int, fam_opt.split("/")))
+
+                                c1,c2,c3 = st.columns(3)
+                                with c1:
+                                    d1 = st.slider("1개입 할인율(%)", 0, 80, 30, 1, key="ladder_d1")
+                                with c2:
+                                    dmid_add = st.slider("가운데 추가 할인(+%p)", 0, 20, 8, 1, key="ladder_mid")
+                                with c3:
+                                    dtop_add = st.slider("최상위 추가 할인(+%p)", 0, 10, 1, 1, key="ladder_top")
+
+                                disc_map = {
+                                    ladder[0]: d1,
+                                    ladder[1]: min(95, d1 + dmid_add),
+                                    ladder[2]: min(95, d1 + dmid_add + dtop_add),
+                                }
+
+                                rec_rows = []
+                                for n in ladder:
+                                    disc = disc_map[n] / 100.0
+                                    price = base_single * n * (1.0 - disc)
+                                    price_r = krw_round(price, 1000)
+                                    unit = price_r / n if n>0 else np.nan
+                                    rec_rows.append({
+                                        "구성": f"{n}개입",
+                                        "할인율(%)": disc_map[n],
+                                        "추천가(원)": int(price_r),
+                                        "개당가(원)": int(round(unit)) if unit==unit else np.nan,
+                                        "가운데옵션_유도": ("✅" if n==ladder[1] else "")
+                                    })
+                                rec_df = pd.DataFrame(rec_rows)
+                                st.dataframe(rec_df, use_container_width=True, height=180)
+                                st.caption("가운데 옵션이 가장 ‘할인율 점프’가 커서 혜택이 커 보이도록 설계됩니다. (예: 30% → 38% → 39%)")
 
 # =============================
 # 4) Plan / Cannibal (simple)
 # =============================
 with tab_plan:
     st.subheader("운영플랜(채널별 오퍼 배치) → 카니발(역전/갭부족) 체크")
-    st.caption("이 탭은 간단 버전입니다. (SKU/SET을 채널에 배치 → SKU별 최저 실질단가로 역전/갭부족 탐지)")
+    st.caption("간단 버전: SKU/SET을 채널에 배치 → SKU별 '최저 실질단가'로 역전/갭부족 탐지")
 
     prod = st.session_state["products_df"].copy()
     if prod.empty:
@@ -927,32 +1441,44 @@ with tab_plan:
             if plan.empty:
                 st.error("플랜이 비어 있습니다.")
             else:
-                # Build effective SKU price per zone from overrides if set; else recompute quickly with auto range
                 eff_rows = []
                 sets_df = st.session_state["sets_df"].copy()
                 bom_df = st.session_state["bom_df"].copy()
                 overrides_df = st.session_state["overrides_df"].copy()
 
-                # helper: compute sku final price in zone using auto range and overrides
                 def sku_zone_price(sku, zone):
                     r = prod[prod["품번"].astype(str)==sku].iloc[0]
                     cost = safe_float(r["원가"], np.nan)
                     if cost != cost or cost <= 0:
                         return np.nan
-                    min_auto, max_auto, _ = compute_auto_range_from_cost(cost, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                                                                         rounding_unit, min_cm, max_cost_ratio, PRICE_ZONES, "공구",
-                                                                         safe_float(r.get("MSRP_오버라이드", np.nan), np.nan))
-                    zdf = build_zone_table(cost, min_auto, max_auto, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                                           st.session_state["target_pos"], rounding_unit, min_cm, overrides_df, "SKU", sku)
+                    min_auto, max_auto, _ = compute_auto_range_from_cost(
+                        cost, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
+                        rounding_unit, min_cm, max_cost_ratio, PRICE_ZONES, "공구",
+                        safe_float(r.get("MSRP_오버라이드", np.nan), np.nan)
+                    )
+                    zdf = build_zone_table(
+                        cost, min_auto, max_auto, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
+                        st.session_state["target_pos"], rounding_unit, min_cm, overrides_df, "SKU", str(sku)
+                    )
                     rr = zdf[zdf["가격영역"]==zone]
                     return float(rr.iloc[0]["최종가격(원)"]) if not rr.empty else np.nan
 
-                # sku '상시' for set allocation weights
+                # sku '상시' ref for set allocation weights (모든 SKU는 비용 크므로 플랜 관련 SKU만 계산)
                 sku_always = {}
-                for sku in prod["품번"].astype(str).tolist():
-                    p = sku_zone_price(sku, "상시")
+                plan_skus = set()
+                for _, pr in plan.iterrows():
+                    if pr["오퍼타입"] == "SKU":
+                        plan_skus.add(str(pr["오퍼ID"]))
+                    else:
+                        sid = str(pr["오퍼ID"])
+                        bb = bom_df[bom_df["세트ID"]==sid]
+                        for s in bb["품번"].astype(str).tolist():
+                            plan_skus.add(s)
+
+                for sku_x in plan_skus:
+                    p = sku_zone_price(sku_x, "상시")
                     if p == p:
-                        sku_always[sku] = p
+                        sku_always[sku_x] = p
 
                 for _, pr in plan.iterrows():
                     zone = pr["가격영역"]
@@ -967,23 +1493,50 @@ with tab_plan:
                         if p == p:
                             eff_rows.append({"가격영역":zone, "품번":oid, "실질단가":p, "오퍼":f"SKU:{oid}"})
                     else:
-                        # set: allocate to components
-                        cost_total = compute_set_cost(oid, bom_df, prod)
-                        if cost_total != cost_total:
+                        cost_total_base = compute_set_cost_v2(oid, bom_df, prod, pack_cost=0.0)
+                        if cost_total_base != cost_total_base:
                             continue
                         srow = sets_df[sets_df["세트ID"]==oid]
                         msrp_ov = safe_float(srow.iloc[0].get("MSRP_오버라이드", np.nan), np.nan) if not srow.empty else np.nan
-                        min_auto, max_auto, _ = compute_auto_range_from_cost(cost_total, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                                                                             rounding_unit, min_cm, max_cost_ratio, PRICE_ZONES, "공구", msrp_ov)
-                        z_set = build_zone_table(cost_total, min_auto, max_auto, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                                                 st.session_state["target_pos"], rounding_unit, min_cm, overrides_df, "SET", oid)
+
+                        anchors = compute_set_anchors_v2(
+                            set_id=oid,
+                            bom_df=bom_df,
+                            products_df=prod,
+                            channels_df=st.session_state["channels_df"],
+                            zone_map=st.session_state["zone_map"],
+                            boundaries=st.session_state["boundaries"],
+                            rounding_unit=rounding_unit,
+                            min_cm=min_cm,
+                            max_cost_ratio=max_cost_ratio,
+                            sku_always_prices=sku_always,
+                            params=st.session_state["set_params"]
+                        )
+                        if anchors is None:
+                            continue
+
+                        cost_total = compute_set_cost_v2(oid, bom_df, prod, anchors["pack_cost"])
+
+                        min_auto, max_auto, _ = compute_set_range_v2(
+                            cost_total, anchors, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
+                            rounding_unit, min_cm, max_cost_ratio, PRICE_ZONES, "공구", msrp_ov
+                        )
+                        z_set = build_zone_table_set_v2(
+                            cost_total, min_auto, max_auto, anchors,
+                            st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
+                            rounding_unit, min_cm, overrides_df, st.session_state["set_disc_df"], st.session_state["set_params"], oid
+                        )
                         rr = z_set[z_set["가격영역"]==zone]
                         if rr.empty:
                             continue
                         set_price = float(rr.iloc[0]["최종가격(원)"])
                         if p_override == p_override and p_override > 0:
                             set_price = p_override
-                        alloc = allocate_set_price_to_components(oid, zone, set_price, prod, bom_df, sku_always)
+
+                        alloc = allocate_set_price_to_components_v2(
+                            oid, zone, set_price, prod, bom_df, sku_always,
+                            hero_sku=anchors.get("hero_sku"), hero_boost=float(st.session_state["set_params"].get("hero_boost", 0.6))
+                        )
                         for _, ar in alloc.iterrows():
                             eff_rows.append({"가격영역":zone, "품번":str(ar["품번"]), "실질단가":float(ar["실질단가"]), "오퍼":f"SET:{oid}"})
 
@@ -996,7 +1549,6 @@ with tab_plan:
                     st.markdown("#### 채널별 SKU 최저 실질단가")
                     st.dataframe(min_eff.sort_values(["품번","가격영역"]), use_container_width=True, height=320)
 
-                    # check across zones per sku
                     order = {z:i for i,z in enumerate(PRICE_ZONES)}
                     viol = []
                     for sku, g in min_eff.groupby("품번"):
@@ -1046,26 +1598,32 @@ with tab_logic:
 - MSRP_base = 원가 / 원가율상한(예: 30%)
 - 그리고 중요한 자동 보정:
   - 각 가격영역 z의 Floor가 그 영역의 BandHigh 안에 들어오도록 Max를 자동 상향합니다.
-  - 그래서 '원가만'으로도 밴드가 0폭으로 붙지 않게 설계합니다.
 - 사용자가 MSRP_오버라이드를 넣으면 그 값이 최우선 Max가 됩니다.
 
-### 4) 밴드(가격영역)
+### 4) 밴드(가격영역) — SKU
 - Min~Max 레인지(0~100%)를 10개 가격영역으로 분할합니다.
-- 경계는 슬라이더(마우스로 드래그)로 조정합니다.
-- 각 영역의 추천가(Target)는 영역 내부 위치(기본 중앙)에서 찍되,
+- 경계는 슬라이더로 조정합니다.
+- SKU 추천가(Target)는 영역 내부 위치(기본 중앙)에서 찍되,
   - Target = max(영역내 위치값, Floor)
   - Floor가 BandHigh를 넘으면 '불가'로 표시합니다.
 
-### 5) 사용자는 마음대로 조정 가능(요구사항 반영)
-- Min을 올리면 모든 가격이 함께 올라갑니다(레인지 기반).
-- Max를 올리면 모든 가격이 함께 올라갑니다.
-- 특정 채널 가격은 오버라이드로 직접 입력할 수 있고, 서열/갭/Floor 위반은 경고만 표시합니다.
+### 5) 세트(v2) 핵심 변경점
+- 세트는 원가가 아니라 **BASE(구성품 상시합)**를 앵커로 사용합니다.
+- 세트 타입 자동 인식:
+  - 멀티팩(multi): 동일 SKU 반복
+  - 믹스팩(assort): 2종 이상 혼합
+  - 선물세트(gift): 구성에 부자재(U* 또는 키워드) 포함 시
+- 세트 Max 후보에 **구성품 MSRP 합(원가 기반 추정) × k**를 추가해 더 현실적인 MSRP를 만듭니다.
+- 세트 추천가(Target)는 밴드 중앙이 아니라
+  - Target_raw = BASE × (1 - Disc[세트타입,채널])
+  - 이후 Floor/Band로 클램프합니다.
+- 구성품 환산 단가(개당 얼마):
+  - 세트가를 구성품 상시가 비중으로 배분
+  - 부자재는 0가중, 히어로 SKU는 가중치 부스트
 
-### 6) 세트
-- 앱에서 세트ID/세트명 생성 후 BOM(구성품 리스트업)을 추가하면
-  - 세트원가 = Σ(구성품원가×수량)
-  - 동일하게 자동 레인지/밴드/추천가를 산출합니다.
-- 세트가격을 구성품별로 배분할 때는 구성품의 상시가(ref)를 가중치로 사용하여 실질단가/할인율을 계산합니다.
+### 6) 사용자는 마음대로 조정 가능(요구사항 반영)
+- Min/Max를 바꾸면 전체 가격이 함께 이동합니다.
+- 특정 채널 가격은 오버라이드로 직접 입력할 수 있고, 서열/갭/Floor 위반은 경고만 표시합니다.
 
 ### 7) 운영플랜/카니발
 - 채널별로 SKU/세트를 배치하면 SKU 기준 '최저 실질단가'를 만들고
