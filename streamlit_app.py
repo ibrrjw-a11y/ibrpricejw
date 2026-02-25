@@ -586,7 +586,9 @@ with tab_single:
         )
 
         st.markdown(f"**선택 SKU:** `{meta['아이템']}`  —  {meta['이름']}")
-        st.write(f"- 원가: **{int(meta['원가합']):,}원**  |  레인지: **{int(meta['Min']):,} ~ {int(meta['Max']):,}원**  |  MSRP(자동/입력/오버라이드): **{(int(meta['MSRP']):,}원) if meta['MSRP']==meta['MSRP'] else 'N/A'}**")
+        msrp_val = meta.get('MSRP', np.nan)
+        msrp_disp = f"{int(msrp_val):,}원" if (msrp_val == msrp_val and msrp_val is not None) else "N/A"
+        st.write(f"- 원가: **{int(meta['원가합']):,}원**  |  레인지: **{int(meta['Min']):,} ~ {int(meta['Max']):,}원**  |  MSRP(자동/입력/오버라이드): **{msrp_disp}**")
         if meta["노트"]:
             st.warning(meta["노트"])
 
