@@ -268,7 +268,7 @@ def build_zone_table(
 ):
     ch_map = channels_df.set_index("채널명").to_dict("index")
     if min_price != min_price or max_price != max_price or max_price <= min_price:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=['가격영역', '비용채널', 'BandLow', 'BandHigh', 'Floor(손익하한)', '추천가(Target)', '가격_오버라이드(원)', '최종가격(원)', '상태', '경고', '마진룸(원)=최종-Floor', '기여이익(원)', '기여이익률(%)'])
 
     rows = []
     span = max_price - min_price
@@ -404,6 +404,8 @@ def compute_predicted_sku_always(products_df, channels_df, zone_map, boundaries,
             include_zones=PRICE_ZONES, min_zone="공구", msrp_override=safe_float(r.get("MSRP_오버라이드", np.nan), np.nan)
         )
         zdf = build_zone_table(cost, min_s, max_s, channels_df, zone_map, boundaries, tp_mid, rounding_unit, min_cm, overrides_df, "SKU", sku)
+        if zdf is None or zdf.empty or ("가격영역" not in zdf.columns):
+            continue
         ar = zdf[zdf["가격영역"]=="상시"]
         if not ar.empty:
             sku_always[sku] = float(ar.iloc[0]["최종가격(원)"])
@@ -468,7 +470,7 @@ def build_zone_table_set(cost_total: float, min_price: float, max_price: float, 
                          overrides_df, disc_df, params, item_id: str):
     ch_map = channels_df.set_index("채널명").to_dict("index")
     if min_price != min_price or max_price != max_price or max_price <= min_price or anchors is None:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=['가격영역', '세트타입', '팩수량(부자재제외)', 'Disc(%)', '비용채널', 'BandLow', 'BandHigh', 'Floor(손익하한)', '추천가(Target)', '가격_오버라이드(원)', '최종가격(원)', '상태', '경고', '마진룸(원)=최종-Floor', '기여이익(원)', '기여이익률(%)'])
     rows = []
     span = max_price - min_price
     set_type = anchors["set_type"]
