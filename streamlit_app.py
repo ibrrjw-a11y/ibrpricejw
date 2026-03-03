@@ -202,11 +202,33 @@ def compute_auto_range_from_cost(
     boundaries: list,
     rounding_unit: int,
     min_cm: float,
-    max_cost_ratio: float,
+    min_cost_ratio_cap: float,         # 예: 0.30  (최저가 원가율 상한)
+    always_cost_ratio_target: float,   # 예: 0.18  (상시 목표 원가율)
+    always_list_disc: float,           # 예: 0.20  (상시할인율: MSRP 대비)
     include_zones: list,
     min_zone: str = "공구",
     msrp_override=np.nan,
+    min_override=np.nan,
+    max_override=np.nan,
 ):
+    """
+    ✅ v6.4 정책(중요): '원가율 30% 상한'은 MSRP가 아니라 "최저가(Min) 바닥" 룰로 적용.
+
+    1) Min 후보
+       - Min_floor = min_zone의 손익하한(Floor)
+       - Min_ratio = 원가 / min_cost_ratio_cap
+       => Min = max(Min_floor, Min_ratio) (Min_오버라이드가 있으면 최우선)
+
+    2) MSRP 후보
+       - Always_target = 원가 / always_cost_ratio_target  (상시 목표 원가율)
+       - MSRP_base = Always_target / (1 - always_list_disc)  (정가 프레이밍)
+       - + 채널별 Floor가 각 영역 BandHigh 안에 들어오도록 MSRP 필요 시 상향
+       - + Max_오버라이드/MSRP_오버라이드가 있으면 최우선 후보로 포함
+
+    3) 최종
+       - Min, Max는 rounding_unit 기준으로 올림(ceil) 처리
+       - Max <= Min이면 최소 스팬을 강제로 부여
+    """
     ch_map = channels_df.set_index("채널명").to_dict("index")
 
     def zone_floor(z):
@@ -215,26 +237,65 @@ def compute_auto_range_from_cost(
         if p is None:
             return np.nan
         return floor_price(
-            cost_total=cost_total, q_orders=1,
-            fee=p["수수료율"], pg=p["PG"], mkt=p["마케팅비"],
-            ship_per_order=p["배송비(주문당)"],
-            ret_rate=p["반품률"], ret_cost_order=p["반품비(주문당)"],
-            min_cm=min_cm
+            cost_total=cost_total,
+            q_orders=1,
+            fee=float(p["수수료율"]),
+            pg=float(p["PG"]),
+            mkt=float(p["마케팅비"]),
+            ship_per_order=float(p["배송비(주문당)"]),
+            ret_rate=float(p["반품률"]),
+            ret_cost_order=float(p["반품비(주문당)"]),
+            min_cm=min_cm,
         )
 
-    min_auto = zone_floor(min_zone)
-    if min_auto != min_auto or min_auto <= 0:
-        return np.nan, np.nan, {"note": "Min(Floor) 산출 불가"}
+    # -----------------
+    # Min (최저가)
+    # -----------------
+    min_floor = zone_floor(min_zone)
 
-    min_auto = krw_round(min_auto, rounding_unit)
-    msrp_base = krw_ceil(cost_total / max_cost_ratio, rounding_unit) if (cost_total == cost_total and cost_total > 0) else np.nan
+    min_ratio = np.nan
+    if cost_total == cost_total and cost_total > 0 and min_cost_ratio_cap and float(min_cost_ratio_cap) > 0:
+        min_ratio = float(cost_total) / float(min_cost_ratio_cap)
 
+    if min_override == min_override and float(min_override) > 0:
+        min_auto = float(min_override)
+        min_note = "Min 오버라이드 적용"
+    else:
+        candidates = []
+        if min_floor == min_floor and min_floor > 0:
+            candidates.append(float(min_floor))
+        if min_ratio == min_ratio and min_ratio > 0:
+            candidates.append(float(min_ratio))
+        if not candidates:
+            return np.nan, np.nan, {"note": "Min 산출 불가: 원가/채널 파라미터를 확인하세요."}
+        min_auto = max(candidates)
+        min_note = "Min = max(손익하한, 원가/원가율상한)"
+
+    min_auto = krw_ceil(min_auto, rounding_unit)
+
+    # -----------------
+    # MSRP (최고가)
+    # -----------------
+    always_target = np.nan
+    msrp_base = np.nan
+    if cost_total == cost_total and cost_total > 0 and always_cost_ratio_target and float(always_cost_ratio_target) > 0:
+        always_target = float(cost_total) / float(always_cost_ratio_target)
+        always_target = krw_ceil(always_target, rounding_unit)
+
+        disc = float(always_list_disc or 0.0)
+        disc = min(max(disc, 0.0), 0.95)
+        msrp_base = float(always_target) / (1.0 - disc)
+        msrp_base = krw_ceil(msrp_base, rounding_unit)
+
+    # -----------------
+    # BandHigh가 각 존 Floor를 담을 수 있도록 Max 자동 상향
+    # -----------------
     max_req = []
     for i, z in enumerate(PRICE_ZONES):
         if z not in include_zones:
             continue
         fz = zone_floor(z)
-        if fz != fz:
+        if fz != fz or fz <= 0:
             continue
         end = boundaries[i+1] / 100.0
         if end <= 0:
@@ -244,22 +305,45 @@ def compute_auto_range_from_cost(
             max_req.append(max_needed)
 
     candidates = []
-    if msrp_base == msrp_base:
-        candidates.append(msrp_base)
+    if msrp_base == msrp_base and msrp_base > 0:
+        candidates.append(float(msrp_base))
     if max_req:
-        candidates.append(max(max_req))
-    if msrp_override == msrp_override and msrp_override is not None and msrp_override > 0:
-        candidates.append(msrp_override)
+        candidates.append(float(max(max_req)))
+    if max_override == max_override and float(max_override) > 0:
+        candidates.append(float(max_override))
+    if msrp_override == msrp_override and float(msrp_override) > 0:
+        candidates.append(float(msrp_override))
 
-    max_auto = krw_ceil(max(candidates), rounding_unit) if candidates else np.nan
-    note = ""
-    if max_req and (max_auto > (msrp_base if msrp_base==msrp_base else 0)):
-        note = "채널 손익하한이 밴드에 들어오도록 MSRP(=Max)를 자동 상향"
-    return min_auto, max_auto, {"note": note, "msrp_base": msrp_base}
+    if not candidates:
+        max_auto = min_auto + rounding_unit * 20
+        max_note = "MSRP 자동값 부족 → 임시 스팬 부여"
+    else:
+        max_auto = float(max(candidates))
+        max_note = "MSRP = max(상시정책기반, 채널Floor충족, 오버라이드)"
 
-# -----------------------------
-# SKU zone table
-# -----------------------------
+    max_auto = krw_ceil(max_auto, rounding_unit)
+
+    # Ensure spread
+    if max_auto <= min_auto:
+        max_auto = min_auto + max(rounding_unit * 20, int(min_auto * 0.2))
+        max_auto = krw_ceil(max_auto, rounding_unit)
+
+    note = f"{min_note} / {max_note}"
+    if max_req:
+        if msrp_base == msrp_base and max_auto > msrp_base:
+            note += " (채널 손익하한이 밴드에 들어오도록 MSRP 자동 상향 포함)"
+        if msrp_base != msrp_base:
+            note += " (채널 손익하한이 밴드에 들어오도록 MSRP 자동 상향 포함)"
+
+    meta = {
+        "note": note,
+        "min_floor": float(min_floor) if min_floor == min_floor else np.nan,
+        "min_ratio": float(min_ratio) if min_ratio == min_ratio else np.nan,
+        "always_target": float(always_target) if always_target == always_target else np.nan,
+        "msrp_base": float(msrp_base) if msrp_base == msrp_base else np.nan,
+    }
+    return float(min_auto), float(max_auto), meta
+
 def build_zone_table(
     cost_total: float, min_price: float, max_price: float,
     channels_df: pd.DataFrame, zone_map: dict, boundaries: list, target_pos: dict,
@@ -364,56 +448,122 @@ def classify_set(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame):
 
     return {"set_type": set_type, "non_acc_units": non_acc_units, "hero_sku": hero_sku, "detail_df": b}
 
-def estimate_sku_msrp_from_cost(sku_cost: float, channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio):
-    if sku_cost != sku_cost or sku_cost <= 0: return np.nan
+
+def estimate_sku_msrp_from_cost(
+    sku_cost: float,
+    channels_df,
+    zone_map,
+    boundaries,
+    rounding_unit,
+    min_cm,
+    min_cost_ratio_cap,
+    always_cost_ratio_target,
+    always_list_disc,
+):
+    """원가만 있을 때 SKU의 Max(=MSRP) 추정치 (v6.4: Min-원가율 룰 + 상시정책 기반)"""
+    if sku_cost != sku_cost or sku_cost <= 0:
+        return np.nan
     _, max_auto, _ = compute_auto_range_from_cost(
-        cost_total=sku_cost, channels_df=channels_df, zone_map=zone_map, boundaries=boundaries,
-        rounding_unit=rounding_unit, min_cm=min_cm, max_cost_ratio=max_cost_ratio,
-        include_zones=PRICE_ZONES, min_zone="공구", msrp_override=np.nan
+        cost_total=float(sku_cost),
+        channels_df=channels_df,
+        zone_map=zone_map,
+        boundaries=boundaries,
+        rounding_unit=rounding_unit,
+        min_cm=min_cm,
+        min_cost_ratio_cap=min_cost_ratio_cap,
+        always_cost_ratio_target=always_cost_ratio_target,
+        always_list_disc=always_list_disc,
+        include_zones=PRICE_ZONES,
+        min_zone="공구",
+        msrp_override=np.nan,
+        min_override=np.nan,
+        max_override=np.nan,
     )
     return float(max_auto) if max_auto == max_auto else np.nan
 
-def compute_set_cost(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame, pack_cost: float):
-    b = bom_df[bom_df["세트ID"] == set_id].copy()
-    if b.empty: return np.nan
-    b["수량"] = pd.to_numeric(b["수량"], errors="coerce").fillna(0).astype(int)
-    b = b.merge(products_df[["품번","원가"]], on="품번", how="left")
-    b["원가"] = pd.to_numeric(b["원가"], errors="coerce").fillna(0.0)
-    return float((b["원가"] * b["수량"]).sum() + float(pack_cost or 0.0))
-
-def get_set_disc_pct(set_type: str, zone: str, pack_units: int, disc_df: pd.DataFrame, params: dict):
-    base = 0.0
-    rr = disc_df[(disc_df["세트타입"]==set_type) & (disc_df["가격영역"]==zone)]
-    if not rr.empty: base = float(rr.iloc[0]["할인율(%)"])
-    step = float(params.get("disc_pack_step_pct", 2.0))
-    cap = float(params.get("disc_pack_cap_pct", 6.0))
-    add = 0.0 if (pack_units is None or pack_units <= 1) else min(cap, step * np.log2(pack_units))
-    return max(0.0, min(95.0, base + add))
-
-def compute_predicted_sku_always(products_df, channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio, overrides_df):
+def compute_predicted_sku_always(
+    prod: pd.DataFrame,
+    channels_df: pd.DataFrame,
+    zone_map: dict,
+    boundaries: list,
+    rounding_unit: int,
+    min_cm: float,
+    min_cost_ratio_cap: float,
+    always_cost_ratio_target: float,
+    always_list_disc: float,
+    overrides_df: pd.DataFrame,
+):
+    """
+    세트 BASE 산출용: SKU의 '상시' 가격(최종)을 예측.
+    - 원가만으로 Min/Max를 생성(v6.4 정책)
+    - zone_table에서 '상시' 최종가격을 가져옴
+    - zdf가 비거나 컬럼이 없으면 안전하게 skip (KeyError 방지)
+    """
     sku_always = {}
-    tp_mid = default_zone_target_pos(boundaries)
-    for _, r in products_df.iterrows():
-        sku = str(r["품번"]).strip()
-        cost = safe_float(r.get("원가", np.nan), np.nan)
-        if cost != cost or cost <= 0: 
+
+    if prod is None or prod.empty:
+        return sku_always
+
+    # SKU별 상시 예측은 "기본 Target 위치"로 산출 (오버라이드는 그대로 반영)
+    default_tp = default_zone_target_pos(boundaries)
+
+    for _, rr in prod.iterrows():
+        sku = str(rr.get("품번", "")).strip()
+        if not sku:
             continue
-        min_s, max_s, _ = compute_auto_range_from_cost(
-            cost_total=cost, channels_df=channels_df, zone_map=zone_map, boundaries=boundaries,
-            rounding_unit=rounding_unit, min_cm=min_cm, max_cost_ratio=max_cost_ratio,
-            include_zones=PRICE_ZONES, min_zone="공구", msrp_override=safe_float(r.get("MSRP_오버라이드", np.nan), np.nan)
+        cost = safe_float(rr.get("원가", np.nan), np.nan)
+        if cost != cost or cost <= 0:
+            continue
+
+        min_auto, max_auto, _ = compute_auto_range_from_cost(
+            cost_total=cost,
+            channels_df=channels_df,
+            zone_map=zone_map,
+            boundaries=boundaries,
+            rounding_unit=rounding_unit,
+            min_cm=min_cm,
+            min_cost_ratio_cap=min_cost_ratio_cap,
+            always_cost_ratio_target=always_cost_ratio_target,
+            always_list_disc=always_list_disc,
+            include_zones=PRICE_ZONES,
+            min_zone="공구",
+            msrp_override=safe_float(rr.get("MSRP_오버라이드", np.nan), np.nan),
+            min_override=safe_float(rr.get("Min_오버라이드", np.nan), np.nan),
+            max_override=safe_float(rr.get("Max_오버라이드", np.nan), np.nan),
         )
-        zdf = build_zone_table(cost, min_s, max_s, channels_df, zone_map, boundaries, tp_mid, rounding_unit, min_cm, overrides_df, "SKU", sku)
-        if zdf is None or zdf.empty or ("가격영역" not in zdf.columns):
+
+        zdf = build_zone_table(
+            cost_total=cost,
+            min_price=float(min_auto),
+            max_price=float(max_auto),
+            channels_df=channels_df,
+            zone_map=zone_map,
+            boundaries=boundaries,
+            target_pos=default_tp,
+            rounding_unit=rounding_unit,
+            min_cm=min_cm,
+            overrides_df=overrides_df,
+            item_type="SKU",
+            item_id=sku,
+        )
+
+        if zdf is None or zdf.empty or "가격영역" not in zdf.columns:
             continue
-        ar = zdf[zdf["가격영역"]=="상시"]
-        if not ar.empty:
-            sku_always[sku] = float(ar.iloc[0]["최종가격(원)"])
+
+        ar = zdf[zdf["가격영역"] == "상시"]
+        if ar.empty:
+            continue
+
+        p = safe_float(ar.iloc[0].get("최종가격(원)", np.nan), np.nan)
+        if p == p and p > 0:
+            sku_always[sku] = float(p)
+
     return sku_always
 
 def compute_set_anchors(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame,
                         sku_always: dict, params: dict,
-                        channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio):
+                        channels_df, zone_map, boundaries, rounding_unit, min_cm,
+                        min_cost_ratio_cap, always_cost_ratio_target, always_list_disc):
     cls = classify_set(set_id, bom_df, products_df)
     b = cls.get("detail_df", pd.DataFrame()).copy()
     if b.empty: return None
@@ -433,7 +583,8 @@ def compute_set_anchors(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataF
             continue
         sku_msrp = estimate_sku_msrp_from_cost(
             safe_float(rr.get("원가", np.nan), np.nan),
-            channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio
+            channels_df, zone_map, boundaries, rounding_unit, min_cm,
+            min_cost_ratio_cap, always_cost_ratio_target, always_list_disc
         )
         if sku_msrp == sku_msrp:
             msrp_sum += float(sku_msrp) * int(rr["수량"])
@@ -451,10 +602,15 @@ def compute_set_anchors(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataF
             "base_sum": base_sum, "msrp_sum_est": msrp_sum, "msrp_set_sum": msrp_set_sum,
             "hero_sku": cls.get("hero_sku"), "detail_df": b}
 
-def compute_set_range(cost_total: float, anchors: dict, channels_df, zone_map, boundaries, rounding_unit, min_cm, max_cost_ratio, msrp_override=np.nan):
+def compute_set_range(cost_total: float, anchors: dict, channels_df, zone_map, boundaries, rounding_unit, min_cm,
+                  min_cost_ratio_cap, always_cost_ratio_target, always_list_disc,
+                  msrp_override=np.nan, min_override=np.nan, max_override=np.nan):
     min_auto, max_cost, meta = compute_auto_range_from_cost(
         cost_total=cost_total, channels_df=channels_df, zone_map=zone_map, boundaries=boundaries,
-        rounding_unit=rounding_unit, min_cm=min_cm, max_cost_ratio=max_cost_ratio,
+        rounding_unit=rounding_unit, min_cm=min_cm, min_cost_ratio_cap=min_cost_ratio_cap,
+                always_cost_ratio_target=always_cost_ratio_target,
+                always_list_disc=always_list_disc,
+
         include_zones=PRICE_ZONES, min_zone="공구", msrp_override=np.nan
     )
     candidates = [max_cost] if max_cost==max_cost else []
@@ -830,9 +986,9 @@ with tab_cal:
     with c1:
         rounding_unit = st.selectbox("반올림 단위(캘)", [10,100,1000], index=2, key="cal_round")
     with c2:
-        max_cost_ratio = st.number_input("MSRP 원가율 상한(캘)", min_value=0.05, max_value=0.80, value=0.30, step=0.01, format="%.2f", key="cal_ratio")
-    with c3:
-        min_cm = st.slider("최소 기여이익률(캘) %", 0, 50, 15, 1, key="cal_cm") / 100.0
+        min_cost_ratio_cap = st.number_input("최저가 원가율 상한", min_value=0.05, max_value=0.95, value=0.30, step=0.01, format="%.2f", key="cal_min_ratio")
+        always_cost_ratio_target = st.number_input("상시 목표 원가율", min_value=0.05, max_value=0.95, value=0.18, step=0.01, format="%.2f", key="cal_always_ratio")
+        always_list_disc = st.slider("상시할인율(MSRP 대비) %", 0, 80, 20, 1, key="cal_list_disc") / 100.0
 
     tol = st.slider("일치 허용오차(±%)", 1, 20, 5, 1, key="cal_tol") / 100.0
 
@@ -850,7 +1006,10 @@ with tab_cal:
                 boundaries=st.session_state["boundaries"],
                 rounding_unit=rounding_unit,
                 min_cm=min_cm,
-                max_cost_ratio=max_cost_ratio,
+                min_cost_ratio_cap=min_cost_ratio_cap,
+                always_cost_ratio_target=always_cost_ratio_target,
+                always_list_disc=always_list_disc,
+
                 overrides_df=st.session_state["overrides_df"],
             )
             new_disc, obs = calibrate_set_disc_from_history(
@@ -883,7 +1042,10 @@ with tab_cal:
                     boundaries=st.session_state["boundaries"],
                     rounding_unit=rounding_unit,
                     min_cm=min_cm,
-                    max_cost_ratio=max_cost_ratio,
+                    min_cost_ratio_cap=min_cost_ratio_cap,
+                always_cost_ratio_target=always_cost_ratio_target,
+                always_list_disc=always_list_disc,
+
                     overrides_df=st.session_state["overrides_df"],
                 )
 
@@ -904,7 +1066,10 @@ with tab_cal:
                         boundaries=st.session_state["boundaries"],
                         rounding_unit=rounding_unit,
                         min_cm=min_cm,
-                        max_cost_ratio=max_cost_ratio,
+                        min_cost_ratio_cap=min_cost_ratio_cap,
+                always_cost_ratio_target=always_cost_ratio_target,
+                always_list_disc=always_list_disc,
+
                     )
                     if anchors is None:
                         continue
@@ -914,7 +1079,7 @@ with tab_cal:
                     min_auto, max_auto, _ = compute_set_range(
                         cost_total, anchors,
                         st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                        rounding_unit, min_cm, max_cost_ratio
+                        rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc
                     )
                     zdf = build_zone_table_set(
                         cost_total, min_auto, max_auto, anchors,
@@ -983,7 +1148,9 @@ with tab_sku:
         with p1:
             rounding_unit = st.selectbox("반올림 단위", [10,100,1000], index=2, key="sku_round")
         with p2:
-            max_cost_ratio = st.number_input("MSRP 원가율 상한(예:0.30)", min_value=0.05, max_value=0.80, value=0.30, step=0.01, format="%.2f", key="sku_ratio")
+            min_cost_ratio_cap = st.number_input("최저가 원가율 상한(예:0.30)", min_value=0.05, max_value=0.95, value=0.30, step=0.01, format="%.2f", key="sku_min_ratio")
+            always_cost_ratio_target = st.number_input("상시 목표 원가율(예:0.18)", min_value=0.05, max_value=0.95, value=0.18, step=0.01, format="%.2f", key="sku_always_ratio")
+            always_list_disc = st.slider("상시할인율(MSRP 대비) %", 0, 80, 20, 1, key="sku_list_disc") / 100.0
         with p3:
             min_cm = st.slider("최소 기여이익률(%)", 0, 50, 15, 1, key="sku_cm") / 100.0
 
@@ -1003,7 +1170,10 @@ with tab_sku:
                 boundaries=st.session_state["boundaries"],
                 rounding_unit=rounding_unit,
                 min_cm=min_cm,
-                max_cost_ratio=max_cost_ratio,
+                min_cost_ratio_cap=min_cost_ratio_cap,
+                always_cost_ratio_target=always_cost_ratio_target,
+                always_list_disc=always_list_disc,
+
                 include_zones=PRICE_ZONES,
                 min_zone="공구",
                 msrp_override=safe_float(row.get("MSRP_오버라이드", np.nan), np.nan),
@@ -1097,7 +1267,9 @@ with tab_set:
             with p1:
                 rounding_unit = st.selectbox("반올림 단위", [10,100,1000], index=2, key="set_round")
             with p2:
-                max_cost_ratio = st.number_input("MSRP 원가율 상한", min_value=0.05, max_value=0.80, value=0.30, step=0.01, format="%.2f", key="set_ratio")
+                min_cost_ratio_cap = st.number_input("최저가 원가율 상한", min_value=0.05, max_value=0.95, value=0.30, step=0.01, format="%.2f", key="set_min_ratio")
+                always_cost_ratio_target = st.number_input("상시 목표 원가율", min_value=0.05, max_value=0.95, value=0.18, step=0.01, format="%.2f", key="set_always_ratio")
+                always_list_disc = st.slider("상시할인율(MSRP 대비) %", 0, 80, 20, 1, key="set_list_disc") / 100.0
             with p3:
                 min_cm = st.slider("최소 기여이익률(%)", 0, 50, 15, 1, key="set_cm") / 100.0
 
@@ -1107,19 +1279,19 @@ with tab_set:
                     st.session_state["channels_df"],
                     st.session_state["zone_map"],
                     st.session_state["boundaries"],
-                    rounding_unit, min_cm, max_cost_ratio,
+                    rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc,
                     st.session_state["overrides_df"]
                 )
                 anchors = compute_set_anchors(
                     set_id, st.session_state["bom_df"], prod, sku_always, st.session_state["set_params"],
                     st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                    rounding_unit, min_cm, max_cost_ratio
+                    rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc
                 )
                 if anchors is None:
                     st.error("세트 앵커 계산 실패")
                 else:
                     cost_total = compute_set_cost(set_id, st.session_state["bom_df"], prod, anchors["pack_cost"])
-                    min_auto, max_auto, meta = compute_set_range(cost_total, anchors, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"], rounding_unit, min_cm, max_cost_ratio)
+                    min_auto, max_auto, meta = compute_set_range(cost_total, anchors, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"], rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc)
                     st.write(f"- 세트 원가합(+pack_cost): **{int(cost_total):,}원** | 자동 레인지: **{int(min_auto):,} ~ {int(max_auto):,}원**")
                     if meta.get("note"): st.info(meta["note"])
 
