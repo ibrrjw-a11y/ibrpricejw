@@ -128,6 +128,27 @@ def to_excel_bytes(df_dict):
     return bio.getvalue()
 
 # -----------------------------
+# Excel template (cost master upload)
+# -----------------------------
+def make_cost_master_template_bytes():
+    """앱 업로드용 '원가/상품명 통일' 템플릿을 생성해 Bytes로 반환."""
+    df = pd.DataFrame(columns=["상품코드", "상품명", "브랜드", "원가 (vat-)"])
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        # header=2 로더와 호환되도록 1~2행은 안내, 3행부터 헤더
+        df.to_excel(writer, index=False, sheet_name="원가_상품마스터", startrow=2)
+        ws = writer.sheets["원가_상품마스터"]
+        ws["A1"] = "원가/상품마스터 업로드 양식"
+        ws["A2"] = "※ 3행(헤더)부터 입력하세요. 원가는 VAT 제외(vat-) 기준 권장."
+        ws.freeze_panes = "A4"
+        # 보기 좋게 폭 조정
+        col_widths = {"A": 16, "B": 48, "C": 16, "D": 14}
+        for col, w in col_widths.items():
+            ws.column_dimensions[col].width = w
+    return bio.getvalue()
+
+
+# -----------------------------
 # Load cost master
 # -----------------------------
 def find_cost_sheet(xls: pd.ExcelFile):
@@ -915,6 +936,15 @@ tab_up, tab_cal, tab_sku, tab_set, tab_logic = st.tabs(
 
 with tab_up:
     st.subheader("A. 원가/상품명 통일 파일 업로드(필수)")
+
+    st.download_button(
+        "원가 업로드 템플릿 다운로드(.xlsx)",
+        data=make_cost_master_template_bytes(),
+        file_name="원가_상품마스터_업로드양식.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="상품코드/상품명/브랜드/원가(vat-)만 채워서 업로드하면 됩니다."
+    )
+
     up = st.file_uploader("원가/상품마스터 업로드(.xlsx)", type=["xlsx","xls"])
     if up is not None:
         try:
