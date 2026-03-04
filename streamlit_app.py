@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import base64
 
 # ============================================================
 # IBR Pricing Simulator v6.3
@@ -120,32 +121,48 @@ def krw_ceil(x, unit=100):
     except Exception:
         return 0
 
+import importlib.util, zipfile
+
+def _pick_excel_engine():
+    """Return a pandas ExcelWriter engine that exists in the runtime, else None."""
+    for eng, mod in [("openpyxl", "openpyxl"), ("xlsxwriter", "xlsxwriter")]:
+        try:
+            if importlib.util.find_spec(mod) is not None:
+                return eng
+        except Exception:
+            continue
+    return None
+
 def to_excel_bytes(df_dict):
+    """
+    Returns: (bytes, ext, mime)
+    - If an Excel engine exists (openpyxl or xlsxwriter): create .xlsx
+    - Else: create .zip of UTF-8-SIG CSVs (one file per sheet)
+    """
+    eng = _pick_excel_engine()
+    if eng is not None:
+        bio = BytesIO()
+        with pd.ExcelWriter(bio, engine=eng) as writer:
+            for sh, df in df_dict.items():
+                df.to_excel(writer, index=False, sheet_name=str(sh)[:31])
+        return bio.getvalue(), "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
     bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+    with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for sh, df in df_dict.items():
-            df.to_excel(writer, index=False, sheet_name=sh[:31])
-    return bio.getvalue()
+            csv = df.to_csv(index=False, encoding="utf-8-sig")
+            zf.writestr(f"{str(sh)[:31]}.csv", csv)
+    return bio.getvalue(), "zip", "application/zip"
 
 # -----------------------------
 # Excel template (cost master upload)
 # -----------------------------
+# ---- Cost master template (no Excel deps) ----
+_COST_TEMPLATE_B64 = """UEsDBBQAAAAIAEp0Y1xGx01IlQAAAM0AAAAQAAAAZG9jUHJvcHMvYXBwLnhtbE3PTQvCMAwG4L9SdreZih6kDkQ9ip68zy51hbYpbYT67+0EP255ecgboi6JIia2mEXxLuRtMzLHDUDWI/o+y8qhiqHke64x3YGMsRoPpB8eA8OibdeAhTEMOMzit7Dp1C5GZ3XPlkJ3sjpRJsPiWDQ6sScfq9wcChDneiU+ixNLOZcrBf+LU8sVU57mym/8ZAW/B7oXUEsDBBQAAAAIAEp0Y1xfUkGh7gAAACsCAAARAAAAZG9jUHJvcHMvY29yZS54bWzNkk1qwzAQRq9StLdHtkMWwvEmJasUCg20dCekSSJq/SBNsXP7ym7iUNoDFLTRzKc3b0CtCkL5iM/RB4xkMD2MtndJqLBhZ6IgAJI6o5WpzAmXm0cfraR8jScIUn3IE0LN+RosktSSJEzAIixE1rVaCRVRko9XvFYLPnzGfoZpBdijRUcJqrIC1k0Tw2XsW7gDJhhhtOm7gHohztU/sXMH2DU5JrOkhmEoh2bO5R0qeHvav8zrFsYlkk5hfpWMoEvADbtNfm22j4cd62perwve5HOoVqJZiZq/T64//O7C1mtzNP/Y+CbYtfDrX3RfUEsDBBQAAAAIAEp0Y1yZXJwjEAYAAJwnAAATAAAAeGwvdGhlbWUvdGhlbWUxLnhtbO1aW3PaOBR+76/QeGf2bQvGNoG2tBNzaXbbtJmE7U4fhRFYjWx5ZJGEf79HNhDLlg3tkk26mzwELOn7zkVH5+g4efPuLmLohoiU8nhg2S/b1ru3L97gVzIkEUEwGaev8MAKpUxetVppAMM4fckTEsPcgosIS3gUy9Zc4FsaLyPW6rTb3VaEaWyhGEdkYH1eLGhA0FRRWm9fILTlHzP4FctUjWWjARNXQSa5iLTy+WzF/NrePmXP6TodMoFuMBtYIH/Ob6fkTlqI4VTCxMBqZz9Wa8fR0kiAgsl9lAW6Sfaj0xUIMg07Op1YznZ89sTtn4zK2nQ0bRrg4/F4OLbL0otwHATgUbuewp30bL+kQQm0o2nQZNj22q6RpqqNU0/T933f65tonAqNW0/Ta3fd046Jxq3QeA2+8U+Hw66JxqvQdOtpJif9rmuk6RZoQkbj63oSFbXlQNMgAFhwdtbM0gOWXin6dZQa2R273UFc8FjuOYkR/sbFBNZp0hmWNEZynZAFDgA3xNFMUHyvQbaK4MKS0lyQ1s8ptVAaCJrIgfVHgiHF3K/99Ze7yaQzep19Os5rlH9pqwGn7bubz5P8c+jkn6eT101CznC8LAnx+yNbYYcnbjsTcjocZ0J8z/b2kaUlMs/v+QrrTjxnH1aWsF3Pz+SejHIju932WH32T0duI9epwLMi15RGJEWfyC265BE4tUkNMhM/CJ2GmGpQHAKkCTGWoYb4tMasEeATfbe+CMjfjYj3q2+aPVehWEnahPgQRhrinHPmc9Fs+welRtH2Vbzco5dYFQGXGN80qjUsxdZ4lcDxrZw8HRMSzZQLBkGGlyQmEqk5fk1IE/4rpdr+nNNA8JQvJPpKkY9psyOndCbN6DMawUavG3WHaNI8ev4F+Zw1ChyRGx0CZxuzRiGEabvwHq8kjpqtwhErQj5iGTYacrUWgbZxqYRgWhLG0XhO0rQR/FmsNZM+YMjszZF1ztaRDhGSXjdCPmLOi5ARvx6GOEqa7aJxWAT9nl7DScHogstm/bh+htUzbCyO90fUF0rkDyanP+kyNAejmlkJvYRWap+qhzQ+qB4yCgXxuR4+5Xp4CjeWxrxQroJ7Af/R2jfCq/iCwDl/Ln3Ppe+59D2h0rc3I31nwdOLW95GblvE+64x2tc0LihjV3LNyMdUr5Mp2DmfwOz9aD6e8e362SSEr5pZLSMWkEuBs0EkuPyLyvAqxAnoZFslCctU02U3ihKeQhtu6VP1SpXX5a+5KLg8W+Tpr6F0PizP+Txf57TNCzNDt3JL6raUvrUmOEr0scxwTh7LDDtnPJIdtnegHTX79l125COlMFOXQ7gaQr4Dbbqd3Do4npiRuQrTUpBvw/npxXga4jnZBLl9mFdt59jR0fvnwVGwo+88lh3HiPKiIe6hhpjPw0OHeXtfmGeVxlA0FG1srCQsRrdguNfxLBTgZGAtoAeDr1EC8lJVYDFbxgMrkKJ8TIxF6HDnl1xf49GS49umZbVuryl3GW0iUjnCaZgTZ6vK3mWxwVUdz1Vb8rC+aj20FU7P/lmtyJ8MEU4WCxJIY5QXpkqi8xlTvucrScRVOL9FM7YSlxi84+bHcU5TuBJ2tg8CMrm7Oal6ZTFnpvLfLQwJLFuIWRLiTV3t1eebnK56Inb6l3fBYPL9cMlHD+U751/0XUOufvbd4/pukztITJx5xREBdEUCI5UcBhYXMuRQ7pKQBhMBzZTJRPACgmSmHICY+gu98gy5KRXOrT45f0Usg4ZOXtIlEhSKsAwFIRdy4+/vk2p3jNf6LIFthFQyZNUXykOJwT0zckPYVCXzrtomC4Xb4lTNuxq+JmBLw3punS0n/9te1D20Fz1G86OZ4B6zh3OberjCRaz/WNYe+TLfOXDbOt4DXuYTLEOkfsF9ioqAEativrqvT/klnDu0e/GBIJv81tuk9t3gDHzUq1qlZCsRP0sHfB+SBmOMW/Q0X48UYq2msa3G2jEMeYBY8wyhZjjfh0WaGjPVi6w5jQpvQdVA5T/b1A1o9g00HJEFXjGZtjaj5E4KPNz+7w2wwsSO4e2LvwFQSwMEFAAAAAgASnRjXJWzPQiBAgAAygUAABgAAAB4bC93b3Jrc2hlZXRzL3NoZWV0MS54bWyVVG1v2jAQ/iuWK1XthxE7sfPSAFJfNG3SJqF26z4bMGA1iTPHlLa/fmc7MMpKq32A3J3vee65c3LDjTYP3UpKi57qqulGeGVtexFF3Wwla9ENdCsbOFloUwsLrllGXWukmHtQXUUxIWlUC9Xg8dDHJmY81GtbqUZODOrWdS3M85Ws9GaEKd4GbtVyZV0gGg9bsZR30v5sJwa8aMcyV7VsOqUbZORihC/pxU3i8n3CvZKbbs9GrpOp1g/O+TofYYIdcyPR811bKaiVYGR1+00u7LWsKuBjGImZVY9yAmkjPNXW6tqdg0orLIQWRr/IxteUlYRc0NL+kxxIelLX4u9eL96140Tt21vln/1cYU5T0clrXf1Sc7sa4RyjuVyIdWVv9eaL7GfFHd9MV53/R5uQS1OMZusO1PRgUFCrJjzFUz/jPQDLjwDiHhAfAI5WSHpAcghgRwCsBzA/mdCKn8ONsGI8NHqDjMsGNme4YULjqnEv0501EFeAsOPTE07yIi1PTxgjSVxGYBQJ4xDgEMndQcZT4p5FHjufJ5zHJXLINC58Ag0MaUJIOOBZFhA5L4eRBYmuXDSDH0jb6Yt3+uKj+vKY0xIlTk+a8vLMGaDI0fMCBJ6DkXMav1JGSRCQUUZ9Kyn1iIKlrPQ9J2k5QIfdO84MMtH95Q9PE4eOSQ6Fzh6F/XSOXC4vfDnKQIcPsJBHKSnKwTsNJ7uG4cY7f51H2j68BZ6Q7O+QX5fwjFf/y8iyjBVvMV1/yJSn3A8rI4S9p+nmI6bX40dhxG/NL9p7ud2W+y7MUjUdqmBvwIYaZBwjE77u4MCC8oXDevHmCpatNC4Bzhda263jPqHd+h7/AVBLAwQUAAAACABKdGNc4O5QR6kCAAAWCwAADQAAAHhsL3N0eWxlcy54bWzdVtuK2zAQ/RXhD6iTmJq4xIE2ECi0ZWH3oa9KLMcCWXJlOST79Z2RHOeymqXtYxM2Hs3RmTOaGeFd9e6sxHMjhGOnVum+TBrnuk9p2u8b0fL+g+mEBqQ2tuUOlvaQ9p0VvOqR1Kp0MZvlaculTtYrPbTb1vVsbwbtymSWpOtVbfTVs0iCA7byVrAjV2Wy4UrurPR7eSvVObgX6NgbZSxzkIookzl6+tcAz8MKsxzjtFIbi840KITf3bj9BvCPHjZIpe4zA8d61XHnhNVbWHiOd76B2Gi/nDtI7WD5eb74mFwJ/gEiO2MrYe9kgmu9UqJ2QLDy0ODTmS5F0DnTglFJfjCa+xwujFsm860rE9dA6S9hHp0Q89EVBB69k8RoQOZ7odQz7vpZT+nPIf1TzUKfv1bYYobVvJhw5tEMYcIC499GC7Fvwi7+KSzr5NG4LwOcR/v1r8E48WRFLU9+faonfSr6nIgOft516vxZyYNuRTj7HwuuV/zCY42x8hXUcAr34BA2YUdhndyjBxrky3OqxxpN5fHFuiv85GV4ecrkB95JdVVlu0EqJ/W4amRVCf2m/hDe8R1c+rv4sL8SNR+Ue5nAMrna30Ulh7aYdj1hJcZdV/sbzuA8n24uaEldiZOoNuPSHnbeZGCA6vjx8/uAbP0njlCcgMURxCgdKgOKE1iUzv90niV5noBRuS2jyJLkLElOYMWQjf9SOnFOAZ/4SYsiy/KcquhmE81gQ9Utz/EvHo3KDRmUDir9Xa3pbtMT8v4cUD19b0Kok9KTSJ2UrjUi8bohoyji3aZ0kEF1gZod1I/r4EzFOVmGXaVyo24wjRQFheAsxmc0z4nq5PiN94e6JVlWFHEEsXgGWUYheBtphMoAc6CQLPPvwYf3UXp5T6XX/4TXvwFQSwMEFAAAAAgASnRjXJeKuxzAAAAAEwIAAAsAAABfcmVscy8ucmVsc52SuW7DMAxAf8XQnjAH0CGIM2XxFgT5AVaiD9gSBYpFnb+v2qVxkAsZeT08EtweaUDtOKS2i6kY/RBSaVrVuAFItiWPac6RQq7ULB41h9JARNtjQ7BaLD5ALhlmt71kFqdzpFeIXNedpT3bL09Bb4CvOkxxQmlISzMO8M3SfzL38ww1ReVKI5VbGnjT5f524EnRoSJYFppFydOiHaV/Hcf2kNPpr2MitHpb6PlxaFQKjtxjJYxxYrT+NYLJD+x+AFBLAwQUAAAACABKdGNcX/Hr01cBAAAzAgAADwAAAHhsL3dvcmtib29rLnhtbI1RTUvDQBT8K2F/gGmLFixNLxa1IFqs9Crb5KV5dD/C7murPSl6KJ7Eq1fBa3+Xtv/Bl4RgwYun3Zn3mJ2Z7S6tm02snQV3WhkfiYwo74ShjzPQ0h/YHAxPUuu0JIZuGvrcgUx8BkBaha1Gox1qiUb0urXW0IX7wBLEhNYwWRBjhKX/nRcwWKDHCSqk+0iUdwUi0GhQ4wqSSDRE4DO7PLcOV9aQVKPYWaUi0awGY3CE8R96VJi8kRNfMiQn15KNRKLdYMEUnadyo9SX7HEBvFyhOdlTVASuLwnOnJ3naKaFDKcI92KUPdRnVWLH/adGm6YYQ9/Gcw2Gqh4dqMKg8RnmXgRGaojE9v31a/Nwu3163L2tvz/X25eP3fOmCMgvDpIqLLHLvepcB3ngBknltzaZQIoGkkvW9cxzYfHQBcVR6rQOj5rHXMxcqRPmrsyFlUmduf6v3g9QSwMEFAAAAAgASnRjXCQem6KtAAAA+AEAABoAAAB4bC9fcmVscy93b3JrYm9vay54bWwucmVsc7WRPQ6DMAyFrxLlADVQqUMFTF1YKy4QBfMjEhLFrgq3L4UBkDp0YbKeLX/vyU6faBR3bqC28yRGawbKZMvs7wCkW7SKLs7jME9qF6ziWYYGvNK9ahCSKLpB2DNknu6Zopw8/kN0dd1pfDj9sjjwDzC8XeipRWQpShUa5EzCaLY2wVLiy0yWoqgyGYoqlnBaIOLJIG1pVn2wT06053kXN/dFrs3jCa7fDHB4dP4BUEsDBBQAAAAIAEp0Y1xlkHmSGQEAAM8DAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbK2TTU7DMBCFrxJlWyUuLFigphtgC11wAWNPGqv+k2da0tszTtpKoBIVhU2seN68z56XrN6PEbDonfXYlB1RfBQCVQdOYh0ieK60ITlJ/Jq2Ikq1k1sQ98vlg1DBE3iqKHuU69UztHJvqXjpeRtN8E2ZwGJZPI3CzGpKGaM1ShLXxcHrH5TqRKi5c9BgZyIuWFCKq4Rc+R1w6ns7QEpGQ7GRiV6lY5XorUA6WsB62uLKGUPbGgU6qL3jlhpjAqmxAyBn69F0MU0mnjCMz7vZ/MFmCsjKTQoRObEEf8edI8ndVWQjSGSmr3ghsvXs+0FOW4O+kc3j/QxpN+SBYljmz/h7xhf/G87xEcLuvz+xvNZOGn/mi+E/Xn8BUEsBAhQDFAAAAAgASnRjXEbHTUiVAAAAzQAAABAAAAAAAAAAAAAAAIABAAAAAGRvY1Byb3BzL2FwcC54bWxQSwECFAMUAAAACABKdGNcX1JBoe4AAAArAgAAEQAAAAAAAAAAAAAAgAHDAAAAZG9jUHJvcHMvY29yZS54bWxQSwECFAMUAAAACABKdGNcmVycIxAGAACcJwAAEwAAAAAAAAAAAAAAgAHgAQAAeGwvdGhlbWUvdGhlbWUxLnhtbFBLAQIUAxQAAAAIAEp0Y1yVsz0IgQIAAMoFAAAYAAAAAAAAAAAAAACAgSEIAAB4bC93b3Jrc2hlZXRzL3NoZWV0MS54bWxQSwECFAMUAAAACABKdGNc4O5QR6kCAAAWCwAADQAAAAAAAAAAAAAAgAHYCgAAeGwvc3R5bGVzLnhtbFBLAQIUAxQAAAAIAEp0Y1yXirscwAAAABMCAAALAAAAAAAAAAAAAACAAawNAABfcmVscy8ucmVsc1BLAQIUAxQAAAAIAEp0Y1xf8evTVwEAADMCAAAPAAAAAAAAAAAAAACAAZUOAAB4bC93b3JrYm9vay54bWxQSwECFAMUAAAACABKdGNcJB6boq0AAAD4AQAAGgAAAAAAAAAAAAAAgAEZEAAAeGwvX3JlbHMvd29ya2Jvb2sueG1sLnJlbHNQSwECFAMUAAAACABKdGNcZZB5khkBAADPAwAAEwAAAAAAAAAAAAAAgAH+EAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLBQYAAAAACQAJAD4CAABIEgAAAAA="""
+
 def make_cost_master_template_bytes():
-    """앱 업로드용 '원가/상품명 통일' 템플릿을 생성해 Bytes로 반환."""
-    df = pd.DataFrame(columns=["상품코드", "상품명", "브랜드", "원가 (vat-)"])
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        # header=2 로더와 호환되도록 1~2행은 안내, 3행부터 헤더
-        df.to_excel(writer, index=False, sheet_name="원가_상품마스터", startrow=2)
-        ws = writer.sheets["원가_상품마스터"]
-        ws["A1"] = "원가/상품마스터 업로드 양식"
-        ws["A2"] = "※ 3행(헤더)부터 입력하세요. 원가는 VAT 제외(vat-) 기준 권장."
-        ws.freeze_panes = "A4"
-        # 보기 좋게 폭 조정
-        col_widths = {"A": 16, "B": 48, "C": 16, "D": 14}
-        for col, w in col_widths.items():
-            ws.column_dimensions[col].width = w
-    return bio.getvalue()
+    """Return the prebuilt .xlsx template bytes (base64-embedded)."""
+    return base64.b64decode(_COST_TEMPLATE_B64.encode("ascii"))
 
 
 # -----------------------------
@@ -1164,9 +1181,9 @@ with tab_cal:
                     st.markdown("**오차 큰 TOP 30**")
                     st.dataframe(cmp_df.sort_values("err_pct", ascending=False).head(30), use_container_width=True, height=320)
 
-                    xb = to_excel_bytes({"pred_vs_actual": cmp_df, "by_zone": by_zone, "by_type": by_type})
-                    st.download_button("검증 결과 다운로드", xb, file_name="validation_sets.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    xb, xb_ext, xb_mime = to_excel_bytes({"pred_vs_actual": cmp_df, "by_zone": by_zone, "by_type": by_type})
+        st.download_button("검증 결과 다운로드", xb, file_name=f"validation_sets.{xb_ext}",
+                          mime=xb_mime)
 
 with tab_sku:
     st.subheader("단품: 원가 기반 자동 산출 → Min/Max/채널가격 수정")
