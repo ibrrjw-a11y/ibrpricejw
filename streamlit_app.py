@@ -5,7 +5,7 @@ from io import BytesIO
 import base64
 
 # ============================================================
-# IBR Pricing Simulator v6.3
+# IBR Pricing Simulator v6.5
 # (Cost-only → Auto prices → You adjust) + Calibration/Validation
 #
 # v6.3 adds:
@@ -15,7 +15,7 @@ import base64
 # - Validate predicted vs actual (accuracy within tolerance)
 # ============================================================
 
-st.set_page_config(page_title="IBR Pricing Simulator v6.3", layout="wide")
+st.set_page_config(page_title="IBR Pricing Simulator v6.5", layout="wide")
 
 PRICE_ZONES = ["공구", "홈쇼핑", "폐쇄몰", "모바일라방", "원데이", "브랜드위크", "홈사", "상시", "오프라인", "MSRP"]
 
@@ -155,6 +155,69 @@ def to_excel_bytes(df_dict):
     return bio.getvalue(), "zip", "application/zip"
 
 # -----------------------------
+# Market anchor helpers (v6.5)
+# -----------------------------
+MARKET_TYPES = ["국내(신규)", "해외(동일)"]
+
+def compute_market_anchors_from_row(row: pd.Series, default_always_disc: float):
+    """
+    (msrp_mkt, always_mkt, disc_used, note) 반환
+
+    입력 우선순위
+    1) MSRP_시장 / 상시_시장 (직접 입력)
+    2) 없으면:
+       - 해외(동일): 동일상품_시장가 × k_brand × k_pack × k_tax
+       - 국내(신규): 경쟁카테고리_기준가 × k_pos × k_brand × k_pack
+    3) 상시는: 상시_시장 직접입력 or MSRP시장×(1-상시할인율_시장)
+    """
+    # 할인율(시장) 기본값
+    disc_pct = safe_float(row.get("상시할인율_시장(%)", np.nan), np.nan)
+    if disc_pct == disc_pct:
+        disc_used = min(max(disc_pct / 100.0, 0.0), 0.95)
+    else:
+        disc_used = min(max(float(default_always_disc or 0.0), 0.0), 0.95)
+
+    msrp_direct = safe_float(row.get("MSRP_시장", np.nan), np.nan)
+    always_direct = safe_float(row.get("상시_시장", np.nan), np.nan)
+
+    # 1) MSRP_시장 직접입력
+    if msrp_direct == msrp_direct and msrp_direct > 0:
+        msrp_mkt = float(msrp_direct)
+        note_msrp = "MSRP_시장(직접)"
+    else:
+        mtype = str(row.get("시장구분", MARKET_TYPES[0]))
+        p_same = safe_float(row.get("동일상품_시장가", np.nan), np.nan)
+        p_cat = safe_float(row.get("경쟁카테고리_기준가", np.nan), np.nan)
+        k_pos = safe_float(row.get("포지셔닝계수(k_pos)", 1.0), 1.0)
+        k_brand = safe_float(row.get("브랜드계수(k_brand)", 1.0), 1.0)
+        k_pack = safe_float(row.get("패키징계수(k_pack)", 1.0), 1.0)
+        k_tax = safe_float(row.get("세금/환율계수(k_tax)", 1.0), 1.0)
+
+        msrp_mkt = np.nan
+        note_msrp = "MSRP_시장값 없음"
+        if ("해외" in mtype) and (p_same == p_same and p_same > 0):
+            msrp_mkt = float(p_same) * float(k_brand) * float(k_pack) * float(k_tax)
+            note_msrp = "동일상품_시장가 기반"
+        elif ("국내" in mtype) and (p_cat == p_cat and p_cat > 0):
+            msrp_mkt = float(p_cat) * float(k_pos) * float(k_brand) * float(k_pack)
+            note_msrp = "경쟁카테고리_기준가 기반"
+
+    # 2) 상시_시장 직접입력
+    if always_direct == always_direct and always_direct > 0:
+        always_mkt = float(always_direct)
+        note_always = "상시_시장(직접)"
+    else:
+        if msrp_mkt == msrp_mkt and msrp_mkt > 0:
+            always_mkt = float(msrp_mkt) * (1.0 - disc_used)
+            note_always = "MSRP시장×(1-상시할인율)"
+        else:
+            always_mkt = np.nan
+            note_always = "상시 시장값 없음"
+
+    return msrp_mkt, always_mkt, disc_used, f"{note_msrp} / {note_always}"
+
+
+# -----------------------------
 # Excel template (cost master upload)
 # -----------------------------
 # ---- Cost master template (no Excel deps) ----
@@ -204,8 +267,24 @@ def load_products_from_cost_master(file) -> pd.DataFrame:
         "원가": pd.to_numeric(df[cost_col], errors="coerce") if cost_col else np.nan,
     })
     out = out[out["품번"].ne("")].drop_duplicates(subset=["품번"]).reset_index(drop=True)
+    # ---- (선택) 시장 앵커 입력 컬럼(v6.5) ----
+    # 직접 입력(가장 우선)
+    out["MSRP_시장"] = np.nan
+    out["상시_시장"] = np.nan
+    out["상시할인율_시장(%)"] = 20.0
 
+    # 근거 입력(직접 입력이 없을 때 사용)
+    out["시장구분"] = MARKET_TYPES[0]
+    out["동일상품_시장가"] = np.nan
+    out["경쟁카테고리_기준가"] = np.nan
+
+    # 보정 계수(기본 1.0)
+    out["포지셔닝계수(k_pos)"] = 1.00
+    out["브랜드계수(k_brand)"] = 1.00
+    out["패키징계수(k_pack)"] = 1.00
+    out["세금/환율계수(k_tax)"] = 1.00
     out["MSRP_오버라이드"] = np.nan
+
     out["Min_오버라이드"] = np.nan
     out["Max_오버라이드"] = np.nan
     out["운영여부"] = True
@@ -248,6 +327,10 @@ def compute_auto_range_from_cost(
     msrp_override=np.nan,
     min_override=np.nan,
     max_override=np.nan,
+    market_msrp=np.nan,
+    market_always=np.nan,
+    market_always_disc=np.nan,
+    msrp_min_gap_pct=0.15,
 ):
     """
     ✅ v6.4 정책(중요): '원가율 30% 상한'은 MSRP가 아니라 "최저가(Min) 바닥" 룰로 적용.
@@ -312,20 +395,72 @@ def compute_auto_range_from_cost(
     min_auto = krw_ceil(min_auto, rounding_unit)
 
     # -----------------
-    # MSRP (최고가)
+    # MSRP/상시 앵커 (v6.5: 시장 입력 반영)
     # -----------------
+    # 1) 시장 상시/정가가 있으면 그걸 우선 사용
+    # 2) 없으면(시장값 미입력) 기존처럼 원가 기반 정책(상시 목표 원가율/상시할인율)로 대체
+
+    # (fallback) 원가 기반 상시 타깃
     always_target = np.nan
-    msrp_base = np.nan
     if cost_total == cost_total and cost_total > 0 and always_cost_ratio_target and float(always_cost_ratio_target) > 0:
         always_target = float(cost_total) / float(always_cost_ratio_target)
         always_target = krw_ceil(always_target, rounding_unit)
 
-        disc = float(always_list_disc or 0.0)
-        disc = min(max(disc, 0.0), 0.95)
-        msrp_base = float(always_target) / (1.0 - disc)
+    # 상시 존 손익하한
+    floor_always = zone_floor("상시")
+
+    # 상시할인율(시장 입력이 있으면 그 값을 사용)
+    disc_used = float(always_list_disc or 0.0)
+    if market_always_disc == market_always_disc:
+        disc_used = float(market_always_disc)
+    disc_used = min(max(disc_used, 0.0), 0.95)
+
+    # 상시 앵커
+    if market_always == market_always and float(market_always) > 0:
+        always_anchor = float(market_always)
+        always_note = "상시=시장상시 기반"
+    else:
+        always_anchor = float(always_target) if always_target == always_target and always_target > 0 else np.nan
+        always_note = "상시=원가정책 기반(시장값 없을 때)"
+
+    # 손익하한보다 낮으면 올림
+    if floor_always == floor_always and floor_always > 0:
+        if always_anchor == always_anchor and always_anchor > 0:
+            always_anchor = max(float(always_anchor), float(floor_always))
+        else:
+            always_anchor = float(floor_always)
+
+    # 상시에서 MSRP 프레이밍(정가) 역산
+    msrp_base = np.nan
+    if always_anchor == always_anchor and always_anchor > 0:
+        msrp_base = float(always_anchor) / (1.0 - disc_used)
         msrp_base = krw_ceil(msrp_base, rounding_unit)
 
-    # -----------------
+    # MSRP 앵커(시장MSRP가 있으면 우선)
+    msrp_anchor = np.nan
+    if market_msrp == market_msrp and float(market_msrp) > 0:
+        cands = [float(market_msrp)]
+        if msrp_base == msrp_base and msrp_base > 0:
+            cands.append(float(msrp_base))
+        msrp_anchor = max(cands)
+        msrp_note = "MSRP=시장MSRP 기반"
+    else:
+        msrp_anchor = msrp_base
+        msrp_note = "MSRP=원가정책 기반(시장값 없을 때)"
+
+    # 최소 간격(밴드 의미 확보): MSRP >= Min*(1+gap)
+    try:
+        gap = float(msrp_min_gap_pct or 0.15)
+    except Exception:
+        gap = 0.15
+    gap = max(0.0, min(0.95, gap))
+    if msrp_anchor == msrp_anchor and msrp_anchor > 0:
+        msrp_anchor = max(float(msrp_anchor), float(min_auto) * (1.0 + gap))
+    else:
+        msrp_anchor = float(min_auto) * (1.0 + gap)
+    msrp_anchor = krw_ceil(msrp_anchor, rounding_unit)
+
+# -----------------
     # BandHigh가 각 존 Floor를 담을 수 있도록 Max 자동 상향
     # -----------------
     max_req = []
@@ -343,8 +478,8 @@ def compute_auto_range_from_cost(
             max_req.append(max_needed)
 
     candidates = []
-    if msrp_base == msrp_base and msrp_base > 0:
-        candidates.append(float(msrp_base))
+    if msrp_anchor == msrp_anchor and msrp_anchor > 0:
+        candidates.append(float(msrp_anchor))
     if max_req:
         candidates.append(float(max(max_req)))
     if max_override == max_override and float(max_override) > 0:
@@ -366,19 +501,22 @@ def compute_auto_range_from_cost(
         max_auto = min_auto + max(rounding_unit * 20, int(min_auto * 0.2))
         max_auto = krw_ceil(max_auto, rounding_unit)
 
-    note = f"{min_note} / {max_note}"
+    note = f"{min_note} / {always_note} / {msrp_note} / {max_note}"
     if max_req:
-        if msrp_base == msrp_base and max_auto > msrp_base:
+        if msrp_anchor == msrp_anchor and max_auto > msrp_anchor:
             note += " (채널 손익하한이 밴드에 들어오도록 MSRP 자동 상향 포함)"
-        if msrp_base != msrp_base:
+        if msrp_anchor != msrp_anchor:
             note += " (채널 손익하한이 밴드에 들어오도록 MSRP 자동 상향 포함)"
 
     meta = {
         "note": note,
         "min_floor": float(min_floor) if min_floor == min_floor else np.nan,
         "min_ratio": float(min_ratio) if min_ratio == min_ratio else np.nan,
-        "always_target": float(always_target) if always_target == always_target else np.nan,
-        "msrp_base": float(msrp_base) if msrp_base == msrp_base else np.nan,
+        "always_target(fallback)": float(always_target) if always_target == always_target else np.nan,
+        "always_anchor": float(always_anchor) if always_anchor == always_anchor else np.nan,
+        "msrp_base(from_always)": float(msrp_base) if msrp_base == msrp_base else np.nan,
+        "msrp_anchor": float(msrp_anchor) if msrp_anchor == msrp_anchor else np.nan,
+        "disc_used": float(disc_used),
     }
     return float(min_auto), float(max_auto), meta
 
@@ -412,9 +550,9 @@ def build_zone_table(
         status = "OK"
         target = max(target_raw, floor)
         if floor > band_high:
-            status = "불가(Floor>BandHigh)"; target = band_high
+            status = "불가(손익하한이 너무 높음)"; target = band_high
         elif target > band_high:
-            status = "클립(Target→BandHigh)"; target = band_high
+            status = "상단에 맞춤"; target = band_high
 
         ov = overrides_df[(overrides_df["오퍼타입"]==item_type) & (overrides_df["오퍼ID"]==item_id) & (overrides_df["가격영역"]==z)]
         override_price = safe_float(ov.iloc[0]["가격_오버라이드"], np.nan) if not ov.empty else np.nan
@@ -429,9 +567,9 @@ def build_zone_table(
         cm, cmr = contrib_metrics(eff_r if eff_r==eff_r else 0, cost_total, 1, p["수수료율"], p["PG"], p["마케팅비"], p["배송비(주문당)"], p["반품률"], p["반품비(주문당)"])
 
         flags = []
-        if eff_r == eff_r and eff_r < floor_r: flags.append("⚠️Floor 미만")
-        if eff_r == eff_r and eff_r < band_low_r: flags.append("⚠️BandLow 미만")
-        if eff_r == eff_r and eff_r > band_high_r and z != "MSRP": flags.append("⚠️BandHigh 초과")
+        if eff_r == eff_r and eff_r < floor_r: flags.append("⚠️손익하한 미만")
+        if eff_r == eff_r and eff_r < band_low_r: flags.append("⚠️영역 하단 미만")
+        if eff_r == eff_r and eff_r > band_high_r and z != "MSRP": flags.append("⚠️영역 상단 초과")
 
         rows.append({
             "가격영역": z, "비용채널": ch,
@@ -497,6 +635,10 @@ def estimate_sku_msrp_from_cost(
     min_cost_ratio_cap,
     always_cost_ratio_target,
     always_list_disc,
+    market_msrp=np.nan,
+    market_always=np.nan,
+    market_always_disc=np.nan,
+    msrp_min_gap_pct=0.15,
 ):
     """원가만 있을 때 SKU의 Max(=MSRP) 추정치 (v6.4: Min-원가율 룰 + 상시정책 기반)"""
     if sku_cost != sku_cost or sku_cost <= 0:
@@ -511,6 +653,10 @@ def estimate_sku_msrp_from_cost(
         min_cost_ratio_cap=min_cost_ratio_cap,
         always_cost_ratio_target=always_cost_ratio_target,
         always_list_disc=always_list_disc,
+        market_msrp=market_msrp,
+        market_always=market_always,
+        market_always_disc=market_always_disc,
+        msrp_min_gap_pct=msrp_min_gap_pct,
         include_zones=PRICE_ZONES,
         min_zone="공구",
         msrp_override=np.nan,
@@ -520,7 +666,7 @@ def estimate_sku_msrp_from_cost(
     return float(max_auto) if max_auto == max_auto else np.nan
 
 def compute_predicted_sku_always(
-    prod: pd.DataFrame,
+    products_df: pd.DataFrame,
     channels_df: pd.DataFrame,
     zone_map: dict,
     boundaries: list,
@@ -529,6 +675,7 @@ def compute_predicted_sku_always(
     min_cost_ratio_cap: float,
     always_cost_ratio_target: float,
     always_list_disc: float,
+    msrp_min_gap_pct: float,
     overrides_df: pd.DataFrame,
 ):
     """
@@ -539,19 +686,21 @@ def compute_predicted_sku_always(
     """
     sku_always = {}
 
-    if prod is None or prod.empty:
+    if products_df is None or products_df.empty:
         return sku_always
 
     # SKU별 상시 예측은 "기본 Target 위치"로 산출 (오버라이드는 그대로 반영)
     default_tp = default_zone_target_pos(boundaries)
 
-    for _, rr in prod.iterrows():
+    for _, rr in products_df.iterrows():
         sku = str(rr.get("품번", "")).strip()
         if not sku:
             continue
         cost = safe_float(rr.get("원가", np.nan), np.nan)
         if cost != cost or cost <= 0:
             continue
+
+        msrp_mkt, always_mkt, disc_used, _mnote = compute_market_anchors_from_row(rr, default_always_disc=always_list_disc)
 
         min_auto, max_auto, _ = compute_auto_range_from_cost(
             cost_total=cost,
@@ -563,6 +712,10 @@ def compute_predicted_sku_always(
             min_cost_ratio_cap=min_cost_ratio_cap,
             always_cost_ratio_target=always_cost_ratio_target,
             always_list_disc=always_list_disc,
+            market_msrp=msrp_mkt,
+            market_always=always_mkt,
+            market_always_disc=disc_used,
+            msrp_min_gap_pct=msrp_min_gap_pct,
             include_zones=PRICE_ZONES,
             min_zone="공구",
             msrp_override=safe_float(rr.get("MSRP_오버라이드", np.nan), np.nan),
@@ -601,10 +754,13 @@ def compute_predicted_sku_always(
 def compute_set_anchors(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataFrame,
                         sku_always: dict, params: dict,
                         channels_df, zone_map, boundaries, rounding_unit, min_cm,
-                        min_cost_ratio_cap, always_cost_ratio_target, always_list_disc):
+                        min_cost_ratio_cap, always_cost_ratio_target, always_list_disc, msrp_min_gap_pct=0.15):
     cls = classify_set(set_id, bom_df, products_df)
     b = cls.get("detail_df", pd.DataFrame()).copy()
     if b.empty: return None
+
+    # SKU별 시장 앵커 조회용
+    prod_map = products_df.set_index("품번").to_dict("index") if (products_df is not None and not products_df.empty) else {}
 
     set_type = cls["set_type"]
     pack_cost = float(params.get("pack_cost_gift", 700.0)) if set_type=="gift" else float(params.get("pack_cost_default", 0.0))
@@ -619,10 +775,23 @@ def compute_set_anchors(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataF
     for _, rr in b.iterrows():
         if rr["is_acc"]: 
             continue
+        sku_key = str(rr.get("품번", "")).strip()
+        prow = prod_map.get(sku_key, None)
+        if prow is None:
+            msrp_mkt = np.nan
+            always_mkt = np.nan
+            disc_used = np.nan
+        else:
+            msrp_mkt, always_mkt, disc_used, _ = compute_market_anchors_from_row(pd.Series(prow), default_always_disc=always_list_disc)
+
         sku_msrp = estimate_sku_msrp_from_cost(
             safe_float(rr.get("원가", np.nan), np.nan),
             channels_df, zone_map, boundaries, rounding_unit, min_cm,
-            min_cost_ratio_cap, always_cost_ratio_target, always_list_disc
+            min_cost_ratio_cap, always_cost_ratio_target, always_list_disc,
+            market_msrp=msrp_mkt,
+            market_always=always_mkt,
+            market_always_disc=disc_used,
+            msrp_min_gap_pct=msrp_min_gap_pct,
         )
         if sku_msrp == sku_msrp:
             msrp_sum += float(sku_msrp) * int(rr["수량"])
@@ -642,12 +811,14 @@ def compute_set_anchors(set_id: str, bom_df: pd.DataFrame, products_df: pd.DataF
 
 def compute_set_range(cost_total: float, anchors: dict, channels_df, zone_map, boundaries, rounding_unit, min_cm,
                   min_cost_ratio_cap, always_cost_ratio_target, always_list_disc,
+                  msrp_min_gap_pct=0.15,
                   msrp_override=np.nan, min_override=np.nan, max_override=np.nan):
     min_auto, max_cost, meta = compute_auto_range_from_cost(
         cost_total=cost_total, channels_df=channels_df, zone_map=zone_map, boundaries=boundaries,
         rounding_unit=rounding_unit, min_cm=min_cm, min_cost_ratio_cap=min_cost_ratio_cap,
                 always_cost_ratio_target=always_cost_ratio_target,
                 always_list_disc=always_list_disc,
+                msrp_min_gap_pct=msrp_min_gap_pct,
 
         include_zones=PRICE_ZONES, min_zone="공구", msrp_override=np.nan
     )
@@ -692,12 +863,12 @@ def build_zone_table_set(cost_total: float, min_price: float, max_price: float, 
             target_raw = base_sum * (1.0 - disc_pct/100.0)
             target = max(target_raw, floor)
             if floor > band_high:
-                status = "불가(Floor>BandHigh)"; target = band_high
+                status = "불가(손익하한이 너무 높음)"; target = band_high
             else:
                 if target > band_high:
-                    status = "클립(Target→BandHigh)"; target = band_high
+                    status = "상단에 맞춤"; target = band_high
                 if target < band_low:
-                    status = "클립(Target→BandLow)"; target = band_low
+                    status = "하단에 맞춤"; target = band_low
 
         ov = overrides_df[(overrides_df["오퍼타입"]=="SET") & (overrides_df["오퍼ID"]==item_id) & (overrides_df["가격영역"]==z)]
         override_price = safe_float(ov.iloc[0]["가격_오버라이드"], np.nan) if not ov.empty else np.nan
@@ -712,9 +883,9 @@ def build_zone_table_set(cost_total: float, min_price: float, max_price: float, 
         cm, cmr = contrib_metrics(eff_r if eff_r==eff_r else 0, cost_total, 1, p["수수료율"], p["PG"], p["마케팅비"], p["배송비(주문당)"], p["반품률"], p["반품비(주문당)"])
 
         flags = []
-        if eff_r == eff_r and eff_r < floor_r: flags.append("⚠️Floor 미만")
-        if eff_r == eff_r and eff_r < band_low_r: flags.append("⚠️BandLow 미만")
-        if eff_r == eff_r and eff_r > band_high_r and z != "MSRP": flags.append("⚠️BandHigh 초과")
+        if eff_r == eff_r and eff_r < floor_r: flags.append("⚠️손익하한 미만")
+        if eff_r == eff_r and eff_r < band_low_r: flags.append("⚠️영역 하단 미만")
+        if eff_r == eff_r and eff_r > band_high_r and z != "MSRP": flags.append("⚠️영역 상단 초과")
 
         rows.append({
             "가격영역": z, "세트타입": set_type, "팩수량(부자재제외)": pack_units, "Disc(%)": round(float(disc_pct),1),
@@ -917,7 +1088,7 @@ def calibrate_set_disc_from_history(set_df, bom_df_hist, products_df, sku_always
 # Session state
 # -----------------------------
 if "products_df" not in st.session_state:
-    st.session_state["products_df"] = pd.DataFrame(columns=["품번","상품명","브랜드","원가","MSRP_오버라이드","Min_오버라이드","Max_오버라이드","운영여부"])
+    st.session_state["products_df"] = pd.DataFrame(columns=["품번","상품명","브랜드","원가","MSRP_시장","상시_시장","상시할인율_시장(%)","시장구분","동일상품_시장가","경쟁카테고리_기준가","포지셔닝계수(k_pos)","브랜드계수(k_brand)","패키징계수(k_pack)","세금/환율계수(k_tax)","MSRP_오버라이드","Min_오버라이드","Max_오버라이드","운영여부"])
 if "channels_df" not in st.session_state:
     st.session_state["channels_df"] = pd.DataFrame(DEFAULT_CHANNELS, columns=["채널명","수수료율","PG","배송비(주문당)","마케팅비","반품률","반품비(주문당)"])
 if "zone_map" not in st.session_state:
@@ -944,7 +1115,7 @@ if "history_bom_df" not in st.session_state:
 # -----------------------------
 # UI
 # -----------------------------
-st.title("IBR 가격 시뮬레이터 v6.3")
+st.title("IBR 가격 시뮬레이터 v6.5")
 st.caption("원가만 업로드 → 자동 가격 생성 → (추가) 기존 운영 데이터로 세트 할인율 역산/검증")
 
 tab_up, tab_cal, tab_sku, tab_set, tab_logic = st.tabs(
@@ -971,6 +1142,18 @@ with tab_up:
             st.error(f"업로드 오류: {e}")
 
     st.metric("현재 SKU 수", f"{len(st.session_state['products_df']):,}")
+    st.divider()
+    st.subheader("A-1. (선택) 시장 앵커/오버라이드 입력(키인)")
+    st.caption("MSRP/상시는 '시장 앵커(동일상품/경쟁카테고리)'가 있으면 우선 반영됩니다. 값 입력 후 자동 가격/세트/캘리브레이션까지 전체에 반영됩니다.")
+    if st.session_state["products_df"].empty:
+        st.info("먼저 원가 파일을 업로드하세요.")
+    else:
+        st.session_state["products_df"] = st.data_editor(
+            st.session_state["products_df"],
+            use_container_width=True,
+            height=260,
+            num_rows="dynamic",
+        )
 
     st.divider()
     st.subheader("B. 채널 비용(키인 즉시 반영)")
@@ -1037,6 +1220,14 @@ with tab_cal:
         always_cost_ratio_target = st.number_input("상시 목표 원가율", min_value=0.05, max_value=0.95, value=0.18, step=0.01, format="%.2f", key="cal_always_ratio")
         always_list_disc = st.slider("상시할인율(MSRP 대비) %", 0, 80, 20, 1, key="cal_list_disc") / 100.0
 
+
+    c4,c5 = st.columns([1,1])
+    with c4:
+        msrp_min_gap_pct = st.slider("MSRP 최소 여유(=Min 대비 +%)", 0, 80, 15, 1, key="cal_gap") / 100.0
+    with c5:
+        min_cm = st.slider("최소 기여이익률(%)", 0, 50, 15, 1, key="cal_cm") / 100.0
+
+
     tol = st.slider("일치 허용오차(±%)", 1, 20, 5, 1, key="cal_tol") / 100.0
 
     st.markdown("**현재 Disc 테이블(세트타입×가격영역)**")
@@ -1056,6 +1247,7 @@ with tab_cal:
                 min_cost_ratio_cap=min_cost_ratio_cap,
                 always_cost_ratio_target=always_cost_ratio_target,
                 always_list_disc=always_list_disc,
+                msrp_min_gap_pct=msrp_min_gap_pct,
 
                 overrides_df=st.session_state["overrides_df"],
             )
@@ -1092,6 +1284,7 @@ with tab_cal:
                     min_cost_ratio_cap=min_cost_ratio_cap,
                 always_cost_ratio_target=always_cost_ratio_target,
                 always_list_disc=always_list_disc,
+                msrp_min_gap_pct=msrp_min_gap_pct,
 
                     overrides_df=st.session_state["overrides_df"],
                 )
@@ -1126,7 +1319,7 @@ with tab_cal:
                     min_auto, max_auto, _ = compute_set_range(
                         cost_total, anchors,
                         st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                        rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc
+                        rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc, msrp_min_gap_pct
                     )
                     zdf = build_zone_table_set(
                         cost_total, min_auto, max_auto, anchors,
@@ -1191,7 +1384,7 @@ with tab_sku:
     if prod.empty:
         st.warning("업로드/설정 탭에서 원가 파일을 업로드하세요.")
     else:
-        p1,p2,p3 = st.columns([1,1,1])
+        p1,p2,p3,p4 = st.columns([1,1,1,1])
         with p1:
             rounding_unit = st.selectbox("반올림 단위", [10,100,1000], index=2, key="sku_round")
         with p2:
@@ -1199,6 +1392,8 @@ with tab_sku:
             always_cost_ratio_target = st.number_input("상시 목표 원가율(예:0.18)", min_value=0.05, max_value=0.95, value=0.18, step=0.01, format="%.2f", key="sku_always_ratio")
             always_list_disc = st.slider("상시할인율(MSRP 대비) %", 0, 80, 20, 1, key="sku_list_disc") / 100.0
         with p3:
+            msrp_min_gap_pct = st.slider("MSRP 최소 여유(=Min 대비 +%)", 0, 80, 15, 1, key="sku_gap") / 100.0
+        with p4:
             min_cm = st.slider("최소 기여이익률(%)", 0, 50, 15, 1, key="sku_cm") / 100.0
 
         options = (prod["품번"].astype(str) + " | " + prod["상품명"].astype(str)).tolist()
@@ -1210,6 +1405,7 @@ with tab_sku:
         if cost != cost or cost <= 0:
             st.error("원가가 비어있거나 0 이하입니다.")
         else:
+            msrp_mkt, always_mkt, disc_used, mnote = compute_market_anchors_from_row(row, default_always_disc=always_list_disc)
             min_auto, max_auto, meta = compute_auto_range_from_cost(
                 cost_total=cost,
                 channels_df=st.session_state["channels_df"],
@@ -1220,6 +1416,10 @@ with tab_sku:
                 min_cost_ratio_cap=min_cost_ratio_cap,
                 always_cost_ratio_target=always_cost_ratio_target,
                 always_list_disc=always_list_disc,
+                market_msrp=msrp_mkt,
+                market_always=always_mkt,
+                market_always_disc=disc_used,
+                msrp_min_gap_pct=msrp_min_gap_pct,
 
                 include_zones=PRICE_ZONES,
                 min_zone="공구",
@@ -1310,7 +1510,7 @@ with tab_set:
 
             st.divider()
             st.markdown("### 세트 추천가")
-            p1,p2,p3 = st.columns([1,1,1])
+            p1,p2,p3,p4 = st.columns([1,1,1,1])
             with p1:
                 rounding_unit = st.selectbox("반올림 단위", [10,100,1000], index=2, key="set_round")
             with p2:
@@ -1318,6 +1518,8 @@ with tab_set:
                 always_cost_ratio_target = st.number_input("상시 목표 원가율", min_value=0.05, max_value=0.95, value=0.18, step=0.01, format="%.2f", key="set_always_ratio")
                 always_list_disc = st.slider("상시할인율(MSRP 대비) %", 0, 80, 20, 1, key="set_list_disc") / 100.0
             with p3:
+                msrp_min_gap_pct = st.slider("MSRP 최소 여유(=Min 대비 +%)", 0, 80, 15, 1, key="set_gap") / 100.0
+            with p4:
                 min_cm = st.slider("최소 기여이익률(%)", 0, 50, 15, 1, key="set_cm") / 100.0
 
             if not bom_view.empty:
@@ -1326,19 +1528,19 @@ with tab_set:
                     st.session_state["channels_df"],
                     st.session_state["zone_map"],
                     st.session_state["boundaries"],
-                    rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc,
+                    rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc, msrp_min_gap_pct,
                     st.session_state["overrides_df"]
                 )
                 anchors = compute_set_anchors(
                     set_id, st.session_state["bom_df"], prod, sku_always, st.session_state["set_params"],
                     st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"],
-                    rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc
+                    rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc, msrp_min_gap_pct
                 )
                 if anchors is None:
                     st.error("세트 앵커 계산 실패")
                 else:
                     cost_total = compute_set_cost(set_id, st.session_state["bom_df"], prod, anchors["pack_cost"])
-                    min_auto, max_auto, meta = compute_set_range(cost_total, anchors, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"], rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc)
+                    min_auto, max_auto, meta = compute_set_range(cost_total, anchors, st.session_state["channels_df"], st.session_state["zone_map"], st.session_state["boundaries"], rounding_unit, min_cm, min_cost_ratio_cap, always_cost_ratio_target, always_list_disc, msrp_min_gap_pct)
                     st.write(f"- 세트 원가합(+pack_cost): **{int(cost_total):,}원** | 자동 레인지: **{int(min_auto):,} ~ {int(max_auto):,}원**")
                     if meta.get("note"): st.info(meta["note"])
 
